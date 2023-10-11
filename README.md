@@ -1,4 +1,15 @@
 # ceph-utils
 Assorted BASH and Python command line scripts to either cut down the amount of typing or get information from multiple places with one command.
 
+ok2stop <hostname>
+Performs checks to see if it is safe to put <hostname> into maintenance mode
+
+startmaint <hostname>
+Puts <hostname> into maintenance mode
+
+endmaint <hostname>
+Takes <hostname> out of maintenance mode
+
+findosd <osdid>
+Finds the host running <osdid> and gets some info (make,serial number,etc) of the drive used.
 
