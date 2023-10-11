@@ -1,0 +1,90 @@
+#! /usr/libexec/platform-python -s
+# 
+# Copyright (c) 2023 Lancaster University
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Written by: Gerard Hand
+#
+
+import subprocess
+import sys
+import json
+
+def run_command( command ):
+    p = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True)
+    (output, err) = p.communicate()
+    return output, err
+
+
+def find_osd( osd ):
+    (output, err) = run_command("ceph osd find "+str(osd))
+    json_data = json.loads(output)
+    return json_data['crush_location']['host']
+
+
+def get_host_devices( osd, host ):
+    device_id = ''
+    linux_device = '';
+    device_path = '';
+    (output, err) = run_command("ceph device ls-by-host "+host+" --format=json-pretty")
+    json_data = json.loads(output)
+    for item in json_data:
+        if ( len(item['daemons']) == 1 and item['daemons'][0] == 'osd.'+str(osd) ):
+            device_id = item['devid']
+            linux_device = '/dev/'+item['location'][0]['dev']
+            device_path = item['location'][0]['path']
+    return device_id, linux_device, device_path
+
+ 
+def get_health_metrics( device_id ):
+    (output, err) = run_command("ceph device get-health-metrics "+device_id)
+    json_data = json.loads(output)
+    last_key = list(json_data) [-1]
+    serial_no = json_data[last_key]['serial_number']
+    product = json_data[last_key]['product']
+    revision = json_data[last_key]['revision']
+    vendor = json_data[last_key]['vendor']
+    smart_passed = json_data[last_key]['smart_status']['passed']
+    return serial_no, vendor, product, revision, smart_passed
+
+
+def main():
+    if (len(sys.argv)>1 and sys.argv[1].isnumeric()):
+        osd = int(sys.argv[1])
+        host = find_osd(osd)
+        devid,linux_device,device_path = get_host_devices( osd, host )
+        serial_no,vendor,product,revision,smart_passed = get_health_metrics( devid )
+        smart_status = 'Passed' if smart_passed  else 'Failed'
+
+        print( '          Host: ', host )
+        print( '     Device ID: ', devid )
+        print( '  Linux Device: ', linux_device )
+        print( '   Device Path: ', device_path )
+        print( '    Serial No.: ', serial_no )
+        print( '        Vendor: ', vendor)
+        print( '       Product: ', product )
+        print( '      Revision: ', revision )
+        print( '  Smart Status: ', smart_status )
+		
+    else:
+        print( 'Usage: osd-details <osd id>' )
+
+if __name__ == '__main__':
+    main();
