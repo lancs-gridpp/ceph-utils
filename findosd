@@ -65,26 +65,23 @@ def get_health_metrics( device_id ):
     return serial_no, vendor, product, revision, smart_passed
 
 
-def main():
-    if (len(sys.argv)>1 and sys.argv[1].isnumeric()):
-        osd = int(sys.argv[1])
-        host = find_osd(osd)
-        devid,linux_device,device_path = get_host_devices( osd, host )
-        serial_no,vendor,product,revision,smart_passed = get_health_metrics( devid )
-        smart_status = 'Passed' if smart_passed  else 'Failed'
+if (len(sys.argv)>1 and sys.argv[1].isnumeric()):
+    osd = int(sys.argv[1])
+    host = find_osd(osd)
+    devid,linux_device,device_path = get_host_devices( osd, host )
+    serial_no,vendor,product,revision,smart_passed = get_health_metrics( devid )
+    smart_status = 'Passed' if smart_passed  else 'Failed'
 
-        print( '          Host: ', host )
-        print( '     Device ID: ', devid )
-        print( '  Linux Device: ', linux_device )
-        print( '   Device Path: ', device_path )
-        print( '    Serial No.: ', serial_no )
-        print( '        Vendor: ', vendor)
-        print( '       Product: ', product )
-        print( '      Revision: ', revision )
-        print( '  Smart Status: ', smart_status )
-		
-    else:
-        print( 'Usage: osd-details <osd id>' )
+    print( '          Host: ', host )
+    print( '     Device ID: ', devid )
+    print( '  Linux Device: ', linux_device )
+    print( '   Device Path: ', device_path )
+    print( '    Serial No.: ', serial_no )
+    print( '        Vendor: ', vendor)
+    print( '       Product: ', product )
+    print( '      Revision: ', revision )
+    print( '  Smart Status: ', smart_status )
+	
+else:
+    print( 'Usage: osd-details <osd id>' )
 
-if __name__ == '__main__':
-    main();
