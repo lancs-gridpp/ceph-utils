@@ -15,3 +15,10 @@ Finds the host running <osdid> and gets some info (make,serial number,etc) of th
 
 cluster_dump.sh [-h] [-c <name>] <out options> [<prefix>]
 Export maps from the cluster to files.
+
+stopceph
+Stop the cephfs file system and put the cluster in "down" state.
+
+startceph
+Put the cluster back in a working state
+
