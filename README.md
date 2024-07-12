@@ -13,3 +13,5 @@ Takes <hostname> out of maintenance mode
 findosd <osdid>
 Finds the host running <osdid> and gets some info (make,serial number,etc) of the drive used.
 
+cluster_dump.sh [-h] [-c <name>] <out options> [<prefix>]
+Export maps from the cluster to files.
