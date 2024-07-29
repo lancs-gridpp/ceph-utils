@@ -1,5 +1,5 @@
 #!/bin/bash
-# 
+#
 # Copyright (c) 2023 Lancaster University
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -24,7 +24,13 @@
 #
 
 if [ -n "$1" ]; then
-	ceph orch host ok-to-stop $1
+    if [[ $1 =~ ^[0-9]+$ ]]; then
+        # Numeric value so must be OSD ID
+        ceph osd ok-to-stop $1
+    else
+        # Host name
+    	ceph orch host ok-to-stop $1
+	fi
 else
-    echo "Usage: ok2stop <host name>"
+    echo "Usage: ok2stop <host name|osd id>"
 fi
