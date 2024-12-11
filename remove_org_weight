@@ -1,0 +1,162 @@
+#! /usr/libexec/platform-python -s
+#--------------------------------------------------------------------------------------
+# MIT License
+#
+# Copyright (c) 2024 University of Lancaster
+# Written by: Gerard Hand
+# Version: 1.0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#--------------------------------------------------------------------------------------
+#
+# Usage: remove_org_weight
+#
+# Description:
+# This script resolves the issue caused by Ceph Orchestrator Bug #67329 (https://tracker.ceph.com/issues/67329)
+# It removes the original_weight key from osd_remove_queue JSON stored in ceph, Fails the current MGR and checks the orchestration status.
+# See: https://gridpp.atlassian.net/wiki/spaces/public/pages/143294703/MGR#Error-ENOENT%3A-Module-Not-Found
+#
+
+import subprocess
+import json
+import sys
+import time
+
+
+def run_ceph_command(command):
+    # Run the ceph command and return the text output from the command.
+    # Exceptions will cause the script to abort.
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            universal_newlines=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        result.check_returncode()
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Error running ceph command: {command}")
+        print(f"stderr: {e.stderr}")
+        sys.exit(1)
+
+
+def get_active_manager():
+    # Get the name of the current MGR daemon.
+    # Exceptions will cause the script to abort.
+    command = "ceph mgr dump -f json"
+    output = run_ceph_command(command)
+    try:
+        mgr_data = json.loads(output)
+        return mgr_data.get("active_name")
+    except json.JSONDecodeError as e:
+        print(f"Failed to get MGR name: {e}")
+        sys.exit(1)
+
+
+def fail_active_manager():
+    # Fail the current MGR daemon.  This will cause ceph to select a new active MGR daemon.
+    command = "ceph mgr fail"
+    print("Failing the active Ceph manager...")
+    run_ceph_command(command)
+    print("")
+
+
+def wait_for_manager_change(original_manager, timeout=30):
+    # Wait for ceph to switch the active MGR daemon.
+    # The script will exit if it timesout waiting.
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        active_manager = get_active_manager()
+        if active_manager and active_manager != original_manager:
+            print(f"Active manager changed from '{original_manager}' to '{active_manager}'.")
+            return
+        time.sleep(2)
+    print(f"Timeout waiting for active manager to change. Current manager: {active_manager}")
+    sys.exit(1)
+
+
+def check_orchestration_status():
+    # Check the orchestration has now started.
+    command = "ceph orch status"
+    output = run_ceph_command(command)
+    if "Available: Yes" in output:
+        print("Ceph orchestration is available.")
+    else:
+        print("Ceph orchestration is not available.")
+
+
+def get_osd_remove_queue():
+    try:
+        # Read the osd_remove_queue JSON from ceph.
+        command = "ceph config-key get mgr/cephadm/osd_remove_queue"
+        return run_ceph_command(command)
+    except subprocess.CalledProcessError as e:
+        print(f"Error reading osd_remove_queue")
+        print(f"stderr: {e.stderr}")
+        sys.exit(1)
+
+
+def set_osd_remove_queue(json_data):
+    try:
+        # Save the osd_remove_queue JSON back into ceph.
+        command = f"ceph config-key set mgr/cephadm/osd_remove_queue '{json_data}'"
+        run_ceph_command(command)
+    except subprocess.CalledProcessError as e:
+        print(f"Error storing updated osd_remove_queue")
+        print(f"stderr: {e.stderr}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    # Remove the original_weight key fom the osd_remove_queue JSON and switch the active MGR daemon
+    original_manager = get_active_manager()
+    print(f"Current active manager: {original_manager}")
+
+    queue_json_string = get_osd_remove_queue()
+    try:
+        osd_remove_queue = json.loads(queue_json_string)
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse JSON: {e}")
+        sys.exit(1)
+
+    new_queue=[]
+    modified = False;
+    for item in osd_remove_queue:
+        if "original_weight" in item:
+            print(f"Removing 'original_weight' from JSON for osd.{item.get('osd_id')}")
+            del item["original_weight"]
+            modified = True;
+        new_queue.append(item)
+
+    if modified:
+        modified_queue_json_string = json.dumps(new_queue)
+        set_osd_remove_queue(modified_queue_json_string)
+        print("Modified JSON saved back to Ceph.")
+        # Switch to a new MGR.  This may take a second or two so wait for it to happen.
+        fail_active_manager()
+        wait_for_manager_change(original_manager)
+    else:
+        print("The JSON was not modified")
+
+    # We have switched to a new MGR so check the orchestration has started.
+    check_orchestration_status()
+
