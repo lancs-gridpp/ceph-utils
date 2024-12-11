@@ -1,0 +1,131 @@
+#!/usr/bin/python3
+#
+#---------------------------------------------------------------------------------
+# Copyright (c) 2024 Lancaster University
+# Written by: Gerard Hand
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#---------------------------------------------------------------------------------
+#
+# Usage: restartosd <osd_id>
+#
+# This script first verifies that is is safe to restart the osd.  If it is safe, it
+# instructs the orchestration to restart the OSD.  This doesn't happen instantly so
+# the script monitors the osd process status to see when it is restarted.  The process
+# minitoring will timeout after about 300 seconds.
+#
+import sys
+import subprocess
+import json
+import time
+from datetime import datetime
+
+def usage():
+    print("Usage: python restartosd <osd_id>")
+    print("Example: python restart_osd 1")
+
+def is_valid_osd_id(osd_id):
+    return osd_id.isdigit()
+
+def check_safe_to_stop(osd_id):
+    try:
+        result = subprocess.run(
+            ["ceph", "osd", "ok-to-stop", f"osd.{osd_id}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            universal_newlines=True
+        )
+        output = json.loads(result.stdout)
+        return output.get("ok_to_stop", False)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return False
+l
+def restart_osd(osd_id):
+    # Instruction the orchestration to restart the osd.
+    start_time = datetime.utcnow()
+    try:
+        subprocess.run(
+            ["ceph", "orch", "daemon", "restart", f"osd.{osd_id}"],
+            check=True
+        )
+    except subprocess.CalledProcessError:
+        print(f"Error: Failed to restart osd.{osd_id}.")
+        sys.exit(3)
+
+    # Check the osd process to see when the "started time" is updated within a timeout period.
+    try:
+        print(f"Waiting for osd.{osd_id} to restart", end="")
+        sys.stdout.flush()
+
+        timeout = 300   # This is approx. since it doesn't take into account execution time which is ok.
+        interval = 5    # time between checking the osd process status.
+        elapsed_time = 0
+
+        while elapsed_time < timeout:
+            print(".",end="")
+            sys.stdout.flush()
+            result = subprocess.run(
+                ["ceph", "orch", "ps", "--daemon_type=osd", f"--daemon_id={osd_id}", "--format=json"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+
+            if result.returncode != 0:
+                print("\nError executing Ceph command: {}".format(result.stderr))
+                return
+
+            process_json = json.loads(result.stdout)
+            process_start = datetime.strptime(process_json[0].get("started"),"%Y-%m-%dT%H:%M:%S.%fZ")
+
+            if process_start > start_time:
+                print(f"\nOSD osd.{osd_id} has been restarted successfully at {process_json[0].get('started')}.")
+                return
+
+            time.sleep(interval)
+            elapsed_time += interval
+
+        print(f"\nTimed out waiting for osd.{osd_id} to restart")
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error: Unable to determine the status of osd.{osd_id}.")
+        print(e)
+        print(result.stderr)
+        sys.exit(4)
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        usage()
+        sys.exit(1)
+
+    osd_id = sys.argv[1]
+
+    if not is_valid_osd_id(osd_id):
+        print("Error: OSD ID must be a numeric value.")
+        usage()
+        sys.exit(1)
+
+    if not check_safe_to_stop(osd_id):
+        print(f"Error: It is not safe to restart osd.{osd_id}.")
+        sys.exit(2)
+
+    restart_osd(osd_id)
+
