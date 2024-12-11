@@ -1,0 +1,152 @@
+#!/usr/bin/python3
+
+#---------------------------------------------------------------------------------
+# Copyright (c) 2024 Lancaster University
+# Written by: Gerard Hand
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#---------------------------------------------------------------------------------
+#
+# Usage: clientlist [-h] [-s {a,h,s,c,l}] [-r]
+#
+# List Ceph sessions
+#
+# optional arguments:
+#   -h, --help            show this help message and exit
+#   -s {a,h,s,c,l}, --sort {a,h,s,c,l}
+#                         Sort by column: address, host, state, num caps, num
+#                         leases
+#   -r, --reverse         Sort in reverse order
+#
+# This script assumes there is one active MDS server.  It gets the current list of
+# sessions from the active MDS and extracts the client information.
+
+import subprocess
+import json
+import argparse
+
+def get_active_mds():
+    try:
+        # Run the Ceph command to get FS status
+        result = subprocess.run(['ceph', 'fs', 'status', '--format=json'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+        # Check if the command executed successfully
+        if result.returncode != 0:
+            print("Error executing Ceph command: {}".format(result.stderr))
+            return None
+
+        # Parse the JSON output
+        fs_status = json.loads(result.stdout)
+
+        # Find the active MDS from the mdsmap
+        active_mds = ""
+
+        for mds in fs_status.get('mdsmap', []):
+            if mds.get('state') == 'active':  # Look for active MDS
+                active_mds = mds.get('name')
+                break
+
+        # Return the active MDS
+        return active_mds
+
+    except Exception as e:
+        print("Error: {}".format(str(e)))
+        return None
+
+
+def get_session_list(active_mds):
+    try:
+        # Run the Ceph command to get list of sessions
+        result = subprocess.run(['ceph', 'tell', 'mds.'+active_mds, 'session', 'ls', '--format=json'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        sessions_json = json.loads(result.stdout)
+
+        sessions = []
+
+        for session in sessions_json:
+            sessions.append((
+                session['id'],
+                session['entity']['addr']['addr'],
+                session['client_metadata']['hostname'],
+                session['state'],
+                session['num_caps'],
+                session['num_leases'],
+                session['client_metadata']['kernel_version'],
+                session['client_metadata']['root']
+
+            ))
+
+        return sessions
+
+    except Exception as e:
+        print("Error: {}".format(str(e)))
+        return None
+
+
+def print_table(data, headers, sort_by=None, reverse=False):
+    # Determine the width of each column
+    column_widths = [max(len(str(row[i])) for row in data) for i in range(len(headers))]
+    column_widths = [max(len(header), width) for header, width in zip(headers, column_widths)]
+
+    # Sort the data if requested
+    if sort_by:
+        data.sort(key=lambda x: x[headers.index(sort_by)], reverse=reverse)
+
+
+    # Print the header row
+    header_row = " | ".join(f"{header:<{width}}" for header, width in zip(headers, column_widths))
+    print("-" * len(header_row))
+    print(header_row)
+    print("-" * len(header_row))
+
+    # Print the data rows
+    for row in data:
+        print(" | ".join(f"{str(cell):<{width}}" for cell, width in zip(row, column_widths)))
+    print("-" * len(header_row))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='List Ceph sessions')
+    parser.add_argument('-s', '--sort', choices=['a', 'h', 's', 'c', 'l'], help='Sort by column: address, host, state, num caps, num leases')
+    parser.add_argument('-r', '--reverse', action='store_true', help='Sort in reverse order')
+    args = parser.parse_args()
+
+    active_mds = get_active_mds()
+    if active_mds:
+        sessions = get_session_list(active_mds)
+        if sessions:
+            # Headers for the table
+            headers = ["ID", "Address", "Hostname", "State", "Num Caps", "Num Leases", "Kernel", "Root"]
+            sort_map = {
+                'a': 'Address',
+                'h': 'Hostname',
+                's': 'State',
+                'c': 'Num Caps',
+                'l': 'Num Leases'
+            }
+
+            # Print the session list as a table
+            print_table(sessions, headers, sort_map.get(args.sort), args.reverse)
+        else:
+            print("No sessions found or error retrieving session data.")
+    else:
+        print("No active MDS found or error retrieving data.")
+
