@@ -57,7 +57,7 @@ def check_safe_to_stop(osd_id):
         return output.get("ok_to_stop", False)
     except (subprocess.CalledProcessError, json.JSONDecodeError):
         return False
-l
+
 def restart_osd(osd_id):
     # Instruction the orchestration to restart the osd.
     start_time = datetime.utcnow()
