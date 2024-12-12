@@ -1,6 +1,8 @@
 #!/bin/sh
 #
+#---------------------------------------------------------------------------------
 # Copyright (c) 2023 Lancaster University
+# Written by: Gerard Hand
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -20,28 +22,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-# Written by: Gerard Hand
+#---------------------------------------------------------------------------------
 #
-if [[ ! -f ~/.clusterconfig ]]; then
-    echo "Creating ~/.clusterconfig"
-    echo "FS=\"\"" > ~/.clusterconfig
-fi
-
-. ~/.clusterconfig
-
-if [[ "$FS" == "" ]]; then
-    echo "ERROR: File system not set."
-    echo "Edit ~/.clusterconfig and set the FS variable to file system name"
-    exit 1
-fi
 
 echo "Stopping Ceph...."
-echo "- Stopping $FS file system"
-ceph fs set gridpp max_mds 1
-ceph fs fail gridpp
-ceph fs set gridpp joinable false
+for FS in $(ceph fs ls -f json | jq -r '.[] | .name'); do
+    echo "- Stopping $FS file system"
+    ceph fs set $FS max_mds 1
+    ceph fs fail $FS
+    ceph fs set $FS joinable false
+done
 
-echo "- Setting Flags"
+echo "- Setting OSD Flags"
 ceph osd set noout
 ceph osd set norecover
 ceph osd set norebalance
@@ -49,6 +41,5 @@ ceph osd set nobackfill
 ceph osd set nodown
 ceph osd set pause
 
-sleep 3
 ceph status
 
