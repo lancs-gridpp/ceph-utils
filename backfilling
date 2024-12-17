@@ -24,11 +24,11 @@
 #
 #---------------------------------------------------------------------------------
 #
-# Usage: scrubbing on|off [mute]
+# Usage: backfilling on|off [mute]
 #
-# This script sets(off)/unsets(on) the OSD flags NOSCRUB and NODEEP_SCRUB.  If scrubbing
-# is turned off (flags set) you can optioninally specify "mute".  This will mute the health warning
-# OSDMAP_FLAGS
+# This script sets(off)/unsets(on) the OSD flag NOBACKFILL.  If backfilling is
+# turned off (flags set) you can optioninally specify "mute".  This will mute the
+# health warning OSDMAP_FLAGS.
 #
 if [ "$1" != "on" ] && [ "$1" != "off" ]; then
   echo "Invalid first parameter. Please use 'on' or 'off'."
@@ -36,11 +36,9 @@ if [ "$1" != "on" ] && [ "$1" != "off" ]; then
 fi
 
 if [ "$1" == "on" ]; then
-  ceph osd unset nodeep-scrub
-  ceph osd unset noscrub
+  ceph osd unset nobackfill
 elif [ "$1" == "off" ]; then
-  ceph osd set nodeep-scrub
-  ceph osd set noscrub
+  ceph osd set nobackfill
   if [ "$2" == "mute" ]; then
     ceph health mute OSDMAP_FLAGS
     echo "OSDMAP_FLAGS muted"

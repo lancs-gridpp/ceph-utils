@@ -24,26 +24,34 @@
 #
 #---------------------------------------------------------------------------------
 #
-# Usage: scrubbing on|off [mute]
+# Usage: starttmux <ceph admin node>
 #
-# This script sets(off)/unsets(on) the OSD flags NOSCRUB and NODEEP_SCRUB.  If scrubbing
-# is turned off (flags set) you can optioninally specify "mute".  This will mute the health warning
-# OSDMAP_FLAGS
+# Create a tmux session with preconfigured windows.  Each window will ssh to the
+# specified admin node:
+# 0: admin
+# 1: status
+# 2: slow ops
+# 3: cluster logs
 #
-if [ "$1" != "on" ] && [ "$1" != "off" ]; then
-  echo "Invalid first parameter. Please use 'on' or 'off'."
-  exit 1
+
+if [[ -z "$1" ]]; then
+    echo "Specify which ceph admin node to use"
+    exit 1
 fi
 
-if [ "$1" == "on" ]; then
-  ceph osd unset nodeep-scrub
-  ceph osd unset noscrub
-elif [ "$1" == "off" ]; then
-  ceph osd set nodeep-scrub
-  ceph osd set noscrub
-  if [ "$2" == "mute" ]; then
-    ceph health mute OSDMAP_FLAGS
-    echo "OSDMAP_FLAGS muted"
-  fi
-fi
+SESSION="ceph-$1"
+
+# Start a new tmux session
+tmux new-session -d -s $SESSION -n admin
+
+# Create windows and run commands
+tmux new-window -t $SESSION:0 -n admin "ssh $1"
+tmux new-window -t $SESSION:1 -n status "ssh $1 -t 'ceph status; exec bash'"
+tmux new-window -t $SESSION:2 -n "slow ops" "ssh $1 -t 'ceph -W cluster | tee cluster_$(date +\'%Y-%m-%d_%H-%M-%S\').log | grep -i slow; exec bash'"
+tmux new-window -t $SESSION:3 -n cluster "ssh $1 -t 'ceph -W cluster; exec bash'"
+
+# Attach to the session
+tmux select-window -t $SESSION:1
+tmux attach-session -t $SESSION
+
 

@@ -5,6 +5,7 @@ Assorted BASH and Python command line scripts to either cut down the amount of t
 
 | Title | Description |
 | --- | --- |
+| backfilling | Set/Unset the OSD backfilling flag and optionally mute the health warning OSDMAP_FLAGS |
 | clientlist | Generate a list of clients connected using CephFS |
 | cluster_dump.sh | Export maps from the cluster to files. Usage: `cluster_dump.sh [-h] [-c <name>] <out options> [<prefix>]` |
 | endmaint | Takes `<hostname>` out of maintenance mode. Usage: `endmaint <hostname>` |
@@ -15,4 +16,5 @@ Assorted BASH and Python command line scripts to either cut down the amount of t
 | scrubbing  | Set/Unset the OSD scrubbing flags and optionally mute the health warning OSDMAP_FLAGS |
 | startceph | Put the cluster back in a working state. Usage: `startceph` |
 | startmaint | Puts `<hostname>` into maintenance mode. Usage: `startmaint <hostname>` |
+| sarttmux | Create a tmux session with predefined windows created. |
 | stopceph | Stop the cephfs file system and put the cluster in "down" state. Usage: `stopceph` |
