@@ -12,6 +12,7 @@ Assorted BASH and Python command line scripts to either cut down the amount of t
 | ok2stop | Performs checks to see if it is safe to stop services on `<hostname>` or stop the service for `<osd_id>`. Usage: `ok2stop <hostname>|<osd_id>` |
 | remove_org_weight | This is a fix for the error "ENOENT: Module Not Found" when running **ceph orch** commands caused by the bug https://tracker.ceph.com/issues/67329 |
 | restartosd | Restart the specified osd id using ceph orhcestration.  Checks are made to make sure it is safe to restart the osd and the script verifies the osd has restarted. |
-startceph | Put the cluster back in a working state. Usage: `startceph` |
+| scrubbing  | Set/Unset the OSD scrubbing flags and optionally mute the health warning OSDMAP_FLAGS |
+| startceph | Put the cluster back in a working state. Usage: `startceph` |
 | startmaint | Puts `<hostname>` into maintenance mode. Usage: `startmaint <hostname>` |
 | stopceph | Stop the cephfs file system and put the cluster in "down" state. Usage: `stopceph` |
