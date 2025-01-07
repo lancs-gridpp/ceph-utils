@@ -1,0 +1,246 @@
+#!/usr/bin/python3
+
+#---------------------------------------------------------------------------------
+# Copyright (c) 2024 Lancaster University
+# Written by: Gerard Hand
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#---------------------------------------------------------------------------------
+#
+#    Usage: pgerrs [-h] [-p] [-o] [-e] [-s] [-a]
+#
+#    Display Ceph PG Inconsistencies.
+#
+#    optional arguments:
+#      -h, --help  show this help message and exit
+#      -p          Display "Inconsistent Placement group"
+#      -o          Display "Summary of inconsistent objects"
+#      -e          Display the "Object Errors"
+#      -s          Display the "Shard Errors"
+#      -a          Display all output (Default)
+#
+#
+
+import sys
+import subprocess
+import json
+import argparse
+
+# Bold escape sequence
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+def get_inconsistent_pgs():
+    # Create a list of inconsistent PGs and errors.
+    inconsistent_pgs = [];
+
+    try:
+        result = subprocess.run(
+            ["ceph", "pg", "dump", "pgs_brief", "--format=json"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+
+        if result.returncode == 0:
+            pg_dump = json.loads(result.stdout)
+            pg_stats = pg_dump.get("pg_stats", [])
+
+            for pg in pg_stats:
+                if "inconsistent" in pg.get("state",""):
+                    pgid = pg["pgid"]
+                    num_objects, ret_errs = get_inconsistent_objects(pgid)
+                    inconsistent_pgs.append(
+                        {
+                                "pgid":  pgid,
+                                "state": pg["state"],
+                                "obj_count": num_objects,
+                                "errs": ret_errs
+                        }
+                    )
+        else:
+            print(f"Error while running ceph command: {result.stderr}")
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error while running ceph command: {e}")
+    except json.JSONDecodeError:
+        print("Failed to decode JSON output from ceph command.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        inconsistent_pgs = [];
+    
+    return inconsistent_pgs
+
+def get_inconsistent_objects(pgid):
+    num_objects = 0
+    ret_errs = []
+    try:
+        result = subprocess.run(
+            ["rados", "list-inconsistent-obj", pgid],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+
+        # list-inconistent-obj returns an error if there is no scrub data available.
+        if result.returncode == 0:
+
+            jsondata = json.loads(result.stdout)
+            obj_array = jsondata.get("inconsistents",[])
+            num_objects = len(obj_array)
+
+            # Iterate each inconsistent object to get the osd and errors
+            for obj in obj_array:
+                # Get shard errors
+                shards = []
+                for shard in obj["shards"]:
+                    if len(shard["errors"]) > 0:
+                        shards.append( [ shard["osd"], shard["shard"], shard["errors"] ] )
+
+                # Store the object data.
+                row = [
+                        pgid,
+                        obj.get("errors",[]),
+                        obj.get("union_shard_errors",[]),
+                        obj["object"]["name"],
+                        shards
+                       ]
+                ret_errs.append( row )
+                
+        else:
+            # Assuming the error was because no scrub info exists.
+            ret_errs = [[pgid, ["No scrub information"], [], "", []]]
+
+    except Exception as e:
+        print(f"An unexpected error occurred while processing PG {pgid}: {e}")
+        ret_errs = [[pgid, ["Error reading object information"], [], "", []]]
+
+    return num_objects, ret_errs
+
+def show_header(header_text):
+    print(f"\n{BOLD}{header_text}{RESET}")
+    
+def show_inconsistent_pgs(inconsistent_pgs):
+    show_header("Inconsistent Placement Groups (PGs):")
+    for pg in inconsistent_pgs:
+        print(f"PG ID: {pg['pgid']}, State: {pg['state']}")
+
+def show_inconsistent_pg_summary(inconsistent_pgs):
+    show_header("Summary of inconsistent objects:")
+    print(f"{'PG ID':<20}{'Inconsistent Objects':<20}")
+    print("-" * 40)
+
+    for pg in inconsistent_pgs:
+        pgid = pg['pgid']
+        obj_count = pg['obj_count']
+        if obj_count == 0:
+            if pg['errs']:
+                print(f"{pgid:<20}{'No scrub information':<20}")
+            else:
+                print(f"{pgid:<20}{'No errors listed':<20}")
+        else:
+            print(f"{pgid:<20}{obj_count:<20}")
+
+def show_object_errors(inconsistent_pgs):
+    show_header("Object Errors:")
+    for pg in inconsistent_pgs:
+        print("\nPG ID: ",pg['pgid'])
+        errs = pg['errs']
+        if errs:
+            for err in errs:
+                pgid, obj_errors, union_errors, obj_name, shards = err
+                print("Object Errors: ",obj_errors)
+                print("Union Errors: ",union_errors)
+        else:
+            print("no errors listed")
+
+def show_shard_errors(err_list):
+    show_header("Shard Errors:")
+    print(f"{'PG ID':<20}{'OSD ID':<10}{'Shard':<8}{'Errors':<30}")
+    print("-" * 68)
+    for err in err_list:
+        pgid, obj_errors, union_errors, obj_name, shards = err
+        if shards:
+            for shard in shards:
+                osdid, shardid, sharderr = shard
+                print(f"{pgid:<20}{osdid:<10}{shardid:<8}{', '.join(sharderr):<30}")
+
+if __name__ == "__main__":
+    
+    parser = argparse.ArgumentParser(description="Display Ceph PG Inconsistencies.")
+    parser.add_argument('-p', action='store_true', help='Display "Inconsistent Placement group"')
+    parser.add_argument('-o', action='store_true', help='Display "Summary of inconsistent objects"')
+    parser.add_argument('-e', action='store_true', help='Display the "Object Errors"')
+    parser.add_argument('-s', action='store_true', help='Display the "Shard Errors"')
+    parser.add_argument('-a', action='store_true', help='Display all output (Default)')
+    
+    # If no arguments have been passed, set the -a option.
+    if len(sys.argv) == 1:
+        sys.argv.extend(["-a"])
+
+    # Validate the arguments.
+    args = parser.parse_args()
+
+    # Output message to start.  Getting the inconsistent PGs can take a few seconds.
+    # Once the PGs have been retrieved, clear the message.
+    print("Getting inconsistent PGs...", end="", flush=True)
+    inconsistent_pgs = get_inconsistent_pgs()
+    print("\r                           \r", end="", flush=True)
+
+    # Got the data so display it.
+    if inconsistent_pgs:
+        if args.p or args.a:
+            show_inconsistent_pgs(inconsistent_pgs)
+
+        if args.o or args.a:
+            show_inconsistent_pg_summary(inconsistent_pgs)
+
+        if args.a or args.e or args.s:
+            # Create a single list of errors.
+            err_list = []
+            shard_errs = False;
+            for pg in inconsistent_pgs:
+                pg_errs = pg['errs']
+                if pg_errs:
+                    try:
+                        for pg_err in pg_errs:
+                            pgid, obj_errors, union_errors, obj_name, shards = pg_err
+                            shard_errs = shard_errs or (len(shards)>0)
+                    except Exception as e:
+                        print("ERR:",pg_errs)
+                        print(e)
+                err_list += pg_errs
+            #print(err_list)
+
+            if err_list:
+                if args.e or args.a:
+                    show_object_errors(inconsistent_pgs)
+
+                if args.s or args.a:
+                    if shard_errs:
+                        show_shard_errors(err_list)
+                    else:
+                        print("There are no shard errors to display")
+            else:
+                print("There are no errors to display")
+
+    else:
+        print("No inconsistent PGs found.")
+
