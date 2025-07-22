@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+
+#---------------------------------------------------------------------------------
+# Copyright (c) 2025 Lancaster University
+# Written by: Gerard Hand
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#---------------------------------------------------------------------------------
+#
+# usage: scrubinfo [-h]
+#                  [--sort {pg_id,acting,scrub_stamp,deep_scrub_stamp,last_scrub_duration,scrub_scheduling,objects,objects_scrubbed}]
+#                  [--pool POOL] [--list-pools] [--reverse] [--version]
+#
+# Extract and display specific columns from ceph pg dump pgs
+#
+# optional arguments:
+#   -h, --help            show this help message and exit
+#   --sort {pg_id,acting,scrub_stamp,deep_scrub_stamp,last_scrub_duration,scrub_scheduling,objects,objects_scrubbed}, -s {pg_id,acting,scrub_stamp,deep_scrub_stamp,last_scrub_duration,scrub_scheduling,objects,objects_scrubbed}
+#                         Column to sort by (default: pg_id)
+#   --pool POOL, -p POOL  Pool ID to filter PGs (e.g., "1" for pool 1)
+#   --list-pools, -l      List available pools and exit
+#   --reverse, -r         Reverse sort order
+#   --version, -v         Show version information and exit
+#
+# Examples:
+#   scrubinfo                                      # Show all PGs
+#   scrubinfo --pool 1                             # Show PGs from pool 1
+#   scrubinfo --sort objects                       # Sort by objects column
+#   scrubinfo --pool 2 --sort last_scrub_duration  # Pool 2 PGs sorted by scrub duration
+#
+
+import subprocess
+import json
+import argparse
+import sys
+
+__version__ = '1.0.0'
+
+def run_ceph_pg_dump():
+    """Get PG information from Ceph."""
+    try:
+        cmd = ['ceph', 'pg', 'dump', 'pgs', '--format=json']
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                              universal_newlines=True, check=True)
+        return json.loads(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print("Error running ceph command: {}".format(e), file=sys.stderr)
+        print("stderr: {}".format(e.stderr), file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print("Error parsing JSON output: {}".format(e), file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError:
+        print("Error: 'ceph' command not found. Make sure Ceph is installed and in PATH.", file=sys.stderr)
+        sys.exit(1)
+
+
+def extract_pg_data(pg_stats, pool_filter=None):
+    """Extract relevant columns from PG stats JSON."""
+    extracted_data = []
+    
+    for pg in pg_stats:
+        # Filter by pool if specified
+        if pool_filter:
+            pg_id = pg.get('pgid', '')
+            pool_id = pg_id.split('.')[0] if '.' in pg_id else ''
+            if pool_id != pool_filter:
+                continue
+        
+        # Extract required columns
+        row = {
+            'pg_id': pg.get('pgid', ''),
+            'acting': '[' + ','.join(map(str, pg.get('acting', []))) + ']',
+            'scrub_stamp': pg.get('last_scrub_stamp', ''),
+            'deep_scrub_stamp': pg.get('last_deep_scrub_stamp', ''),
+            'last_scrub_duration': pg.get('last_scrub_duration', 0),
+            'scrub_scheduling': pg.get('scrub_schedule', ''),
+            'objects': pg.get('stat_sum', {}).get('num_objects', 0),
+            'objects_scrubbed': pg.get('objects_scrubbed', 0)
+        }
+        extracted_data.append(row)
+    return extracted_data
+
+
+def sort_data(data, sort_column, reverse_sort=False):
+    """Sort data by specified column and order."""
+    if not data:
+        return data
+    
+    if sort_column not in data[0]:
+        print("Warning: Sort column '{}' not found. Available columns: {}".format(
+            sort_column, ', '.join(data[0].keys())))
+        return data
+    
+    # Determine if we should sort numerically
+    numeric_columns = {'last_scrub_duration', 'objects', 'objects_scrubbed'}
+    
+    if sort_column in numeric_columns:
+        try:
+            return sorted(data, key=lambda x: float(x[sort_column] or 0), reverse=reverse_sort)
+        except (ValueError, TypeError):
+            pass
+    
+    # Sort as string
+    return sorted(data, key=lambda x: str(x[sort_column] or ''), reverse=reverse_sort)
+
+
+def format_output(data):
+    """Format and print the data in a table."""
+    if not data:
+        print("No data to display.")
+        return
+    
+    # Define column headers and their display widths
+    headers = {
+        'pg_id': 'PG_ID',
+        'acting': 'ACTING',
+        'scrub_stamp': 'SCRUB_STAMP',
+        'deep_scrub_stamp': 'DEEP_SCRUB_STAMP',
+        'last_scrub_duration': 'DURATION',
+        'scrub_scheduling': 'SCHEDULE',
+        'objects': 'OBJECTS',
+        'objects_scrubbed': 'OBJ_SCRUBBED'
+    }
+    
+    # Calculate column widths
+    widths = {}
+    for col, header in headers.items():
+        max_width = max(
+            len(header),
+            max(len(str(row[col] or '')) for row in data)
+        )
+        widths[col] = max_width
+    
+    # Print header
+    header_row = ' | '.join(headers[col].ljust(widths[col]) for col in headers.keys())
+    print(header_row)
+    print('-' * len(header_row))
+    
+    # Print data rows
+    for row in data:
+        data_row = ' | '.join(str(row[col] or '').ljust(widths[col]) for col in headers.keys())
+        print(data_row)
+
+
+def get_available_pools():
+    """Get list of available pools from ceph."""
+    try:
+        cmd = ['ceph', 'osd', 'lspools', '--format=json']
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                              universal_newlines=True, check=True)
+        pools_data = json.loads(result.stdout)
+        return [str(pool['poolnum']) for pool in pools_data]
+    except Exception as e:
+        print("Warning: Could not retrieve pool list: {}".format(e), file=sys.stderr)
+        return []
+
+def create_arg_parser():
+    """Create and return the argument parser."""
+    parser = argparse.ArgumentParser(
+        description='Extract and display specific columns from ceph pg dump pgs',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                                      # Show all PGs
+  %(prog)s --pool 1                             # Show PGs from pool 1
+  %(prog)s --sort objects                       # Sort by objects column
+  %(prog)s --pool 2 --sort last_scrub_duration  # Pool 2 PGs sorted by scrub duration
+        """
+    )
+    
+    parser.add_argument(
+        '--sort', '-s',
+        choices=['pg_id', 'acting', 'scrub_stamp', 'deep_scrub_stamp', 
+                'last_scrub_duration', 'scrub_scheduling', 'objects', 'objects_scrubbed'],
+        default='pg_id',
+        help='Column to sort by (default: pg_id)'
+    )
+    
+    parser.add_argument(
+        '--pool', '-p',
+        type=str,
+        help='Pool ID to filter PGs (e.g., "1" for pool 1)'
+    )
+    
+    parser.add_argument(
+        '--list-pools', '-l',
+        action='store_true',
+        help='List available pools and exit'
+    )
+
+    parser.add_argument(
+        '--reverse', '-r', 
+        action='store_true',
+        help='Reverse sort order'
+    )
+
+    parser.add_argument(
+        '--version', '-v',
+        action='version',
+        version='%(prog)s ' + __version__,
+        help='Show version information and exit'
+    )
+    
+    return parser.parse_args()
+
+def list_pools():
+    """List available pools."""
+    pools = get_available_pools()
+    if pools:
+        print("Available pools:")
+        for pool in pools:
+            print("  {}".format(pool))
+    else:
+        print("No pools found or unable to retrieve pool information.")
+
+def pg_stats_location(pg_dump):
+    """Determine the location of pg_stats in the pg_dump JSON."""
+    if 'pg_map' in pg_dump and 'pg_stats' in pg_dump['pg_map']:
+        return pg_dump['pg_map']['pg_stats']
+    elif 'pg_stats' in pg_dump:
+        return pg_dump['pg_stats']
+    elif 'pgstats' in pg_dump:
+        return pg_dump['pgstats']
+    else:
+        return None
+
+def main():
+    args = create_arg_parser()
+    
+    # List pools if requested
+    if args.list_pools:
+        list_pools()
+        return
+    
+    # Get PG dump data
+    print("Fetching PG data from Ceph...", file=sys.stderr)
+    pg_dump = run_ceph_pg_dump()
+    
+    # Try to find pg_stats in different possible locations
+    pg_stats = pg_stats_location(pg_dump)
+    if pg_stats == None:
+        print("Error: Could not find pg_stats in JSON output", file=sys.stderr)
+        sys.exit(1)
+    if not pg_stats:
+        print("Error: pg_stats is empty", file=sys.stderr)
+        sys.exit(1)
+
+    # Extract and process data
+    extracted_data = extract_pg_data(pg_stats, args.pool)
+    
+    if not extracted_data:
+        if args.pool:
+            print("No PGs found for pool {}".format(args.pool))
+        else:
+            print("No PG data found")
+        return
+    
+    # Sort data
+    sorted_data = sort_data(extracted_data, args.sort, args.reverse)
+    
+    # Display results
+    if args.pool:
+        print("PGs from pool {} (sorted by {}):".format(args.pool, args.sort))
+    else:
+        print("All PGs (sorted by {}):".format(args.sort))
+    
+    print("Total PGs: {}".format(len(sorted_data)))
+    print()
+    
+    format_output(sorted_data)
+
+
+if __name__ == '__main__':
+    main()

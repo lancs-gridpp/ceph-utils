@@ -16,6 +16,7 @@ Assorted BASH and Python command line scripts to either cut down the amount of t
 | remove_org_weight | This is a fix for the error "ENOENT: Module Not Found" when running **ceph orch** commands caused by the bug https://tracker.ceph.com/issues/67329 |
 | restartosd | Restart the specified osd id using ceph orhcestration.  Checks are made to make sure it is safe to restart the osd and the script verifies the osd has restarted. |
 | scrubbing  | Set/Unset the OSD scrubbing flags and optionally mute the health warning OSDMAP_FLAGS |
+| scrubinfo | Show the PG scrubbing information |
 | startceph | Put the cluster back in a working state. Usage: `startceph` |
 | startmaint | Puts `<hostname>` into maintenance mode. Usage: `startmaint <hostname>` |
 | sarttmux | Create a tmux session with predefined windows created. |
