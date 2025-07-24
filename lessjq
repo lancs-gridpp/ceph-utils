@@ -1,0 +1,116 @@
+#!/bin/bash
+
+#---------------------------------------------------------------------------------
+# Copyright (c) 2025 Lancaster University
+# Written by: Gerard Hand
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#---------------------------------------------------------------------------------
+#
+# lessjq - Format JSON with jq and display in less with color and wide mode
+#
+# Usage: lessjq [filename]
+#        cat file.json | lessjq
+#
+set -euo pipefail
+
+# Function to display usage
+usage() {
+    echo "Usage: $0 [filename]"
+    echo "       cat file.json | $0"
+    echo ""
+    echo "Formats JSON data with jq and displays it in less with color and wide mode."
+    exit 1
+}
+
+# Function to check if required commands exist
+check_dependencies() {
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "Error: jq is required but not installed." >&2
+        echo "Install it with: apt-get install jq (Ubuntu/Debian) or brew install jq (macOS)" >&2
+        exit 1
+    fi
+    
+    if ! command -v less >/dev/null 2>&1; then
+        echo "Error: less is required but not installed." >&2
+        exit 1
+    fi
+}
+
+# Function to process JSON data
+process_json() {
+    local input_source="$1"
+    
+    # Use jq to format and colorize the JSON, then pipe to less
+    # jq options:
+    #   -C: colorize output
+    #   .: format/pretty-print the JSON
+    # less options:
+    #   -R: interpret ANSI color sequences
+    #   -S: chop long lines (wide mode)
+    #   -F: quit if content fits on one screen
+    #   -X: don't clear screen on exit
+    if [ "$input_source" = "stdin" ]; then
+        jq -C . | less -RSF
+    else
+        jq -C . "$input_source" | less -RSF
+    fi
+}
+
+# Main script logic
+main() {
+    check_dependencies
+    
+    # Handle help flags
+    if [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+        usage
+    fi
+    
+    # Check if data is being piped in
+    if [ ! -t 0 ]; then
+        # Data is coming from stdin (pipe)
+        if [ $# -gt 0 ]; then
+            echo "Warning: Ignoring filename argument when reading from pipe" >&2
+        fi
+        process_json "stdin"
+    elif [ $# -eq 1 ]; then
+        # File argument provided
+        if [ ! -f "$1" ]; then
+            echo "Error: File '$1' does not exist or is not a regular file." >&2
+            exit 1
+        fi
+        if [ ! -r "$1" ]; then
+            echo "Error: File '$1' is not readable." >&2
+            exit 1
+        fi
+        process_json "$1"
+    elif [ $# -eq 0 ]; then
+        # No arguments and no pipe
+        echo "Error: No input provided. Either specify a filename or pipe JSON data." >&2
+        usage
+    else
+        # Too many arguments
+        echo "Error: Too many arguments. Only one filename is allowed." >&2
+        usage
+    fi
+}
+
+# Run the main function with all arguments
+main "$@"
