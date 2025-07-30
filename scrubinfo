@@ -150,15 +150,21 @@ def format_output(data):
         widths[col] = max_width
     
     # Print header
-    header_row = ' | '.join(headers[col].ljust(widths[col]) for col in headers.keys())
-    print(header_row)
-    print('-' * len(header_row))
-    
-    # Print data rows
-    for row in data:
-        data_row = ' | '.join(str(row[col] or '').ljust(widths[col]) for col in headers.keys())
-        print(data_row)
-
+    try:
+        header_row = ' | '.join(headers[col].ljust(widths[col]) for col in headers.keys())
+        print(header_row)
+        print('-' * len(header_row))
+        
+        # Print data rows
+        for row in data:
+            data_row = ' | '.join(str(row[col] or '').ljust(widths[col]) for col in headers.keys())
+            print(data_row)
+    except BrokenPipeError as e:
+        pass  # Handle broken pipe error if output is piped and closed
+    except Exception as e:
+        print("Error formatting output: {}".format(e), file=sys.stderr)
+        sys.exit(1)
+        
 
 def get_available_pools():
     """Get list of available pools from ceph."""
