@@ -54,6 +54,8 @@ STAT_NONE = ' '
 #STAT_DOWN = '\u2191' # Unicode arrow down
 #STAT_RIGHT = '\u2192' # Unicode arrow right
 
+IDLE_TIMEOUT = 60  # Number of seconds a pg can be idle before it is no longer shown.
+
 class NonBlockingConsole(object):
     """Context manager for non-blocking console input."""
     def __init__(self):
@@ -74,7 +76,15 @@ class NonBlockingConsole(object):
         return False
 
 def get_pg_status():
-    """Run the ceph pg dump command and return parsed JSON data."""
+    """
+    Run the 'ceph pg dump' command and return parsed JSON data.
+    Returns:
+        dict: Parsed JSON data from ceph pg dump command.
+    Raises:
+        subprocess.CalledProcessError: If the ceph command fails.
+        ValueError: If the JSON output cannot be parsed.
+        OSError: If the ceph command is not found.
+    """
     try:
         # Use Popen for Python 3.6 compatibility
         process = subprocess.Popen(
@@ -130,11 +140,18 @@ def format_duration(start_time, current_time=None):
 
     return "{:02d}:{:02d}:{:02d}".format(hours, minutes, seconds)
 
-def extract_scrub_info(pg_data):
-    """Extract scrub information from PG data."""
+def extract_scrub_info(pg_data, current_time=None):
+    """
+    Extract scrub information from PG data.
+    Args:
+        pg_data (dict): PG data from ceph pg dump.
+        current_time (float): Current monotonic time for objects scrubbed per second.
+    Returns:
+        dict: Extracted scrub information.
+    """
     scrub_info = {'pgid': '', 'total_objects': 0, 'total_bytes': 0, 'objects_scrubbed': 0,
                   'scrub_time': None, 'deep_scrub_time': None, 'scrub_type': '', 'scrub_schedule': '',
-                  'state': STAT_NONE, 'idle': 0}
+                  'state': STAT_NONE, 'idle': 0, 'data_time': current_time, 'objects_per_sec': 0.0}
     
     scrub_info['pgid'] = pg_data.get('pgid','')
 
@@ -157,6 +174,11 @@ def extract_scrub_info(pg_data):
     return scrub_info
 
 def get_scrubbing_pg_info():
+    """
+    Get information about scrubbing PGs from Ceph.
+    Returns:
+        tuple: (scrubbing_pgs (dict), count_shallow (int), count_deep (int))
+    """
     data = get_pg_status()
     pg_stats = data.get('pg_stats', [])
 
@@ -165,20 +187,22 @@ def get_scrubbing_pg_info():
         sys.exit(1)
 
     scrubbing_pgs = {}
-
     # Find PGs that are currently scrubbing
-    cnt_shallow = 0
-    cnt_deep = 0
+    count_shallow = 0
+    count_deep = 0
+    # Get the current monotonic time for calculating objects scrubbed per second.
+    data_time = time.monotonic()
+
     for pg in pg_stats:
         pg_id = pg.get('pgid', '')
         pg_state = pg.get('state', '')
         if 'scrubbing' in pg_state:
-            scrubbing_pgs[pg_id] = extract_scrub_info(pg)
+            scrubbing_pgs[pg_id] = extract_scrub_info(pg,data_time)
             if 'deep' in pg_state:
-                cnt_deep += 1
+                count_deep += 1
             else:
-                cnt_shallow += 1
-    return scrubbing_pgs, cnt_shallow, cnt_deep
+                count_shallow += 1
+    return scrubbing_pgs, count_shallow, count_deep
 
 def clear_screen():
     os.system('clear')
@@ -189,47 +213,68 @@ def hide_cursor():
     sys.stdout.flush()
 
 def show_cursor():
+    """
+    Make the cursor visible again.
+    """
     # Show the cursor
     sys.stdout.write("\033[?25h")
     sys.stdout.flush()
 
 def reset_cursor():
+    """
+    Move the cursor to the top left corner of the terminal.
+    """
     # Move the cursor to the top left corner
     sys.stdout.write("\033[H")
     sys.stdout.flush()
 
 def fetch_pg_data():
-    """Fetch the scrubbing PGs from ceph and the number of shallow and deep scrubs."""
+    """
+    Fetch the scrubbing PGs from ceph and the number of shallow and deep scrubs.
+    
+    Returns:
+        tuple: (scrubbing_pgs (dict), count_shallow (int), count_deep (int))
+    """
     print("Fetching Ceph PG information...")
-    scrubbing_pgs, cnt_shallow, cnt_deep = get_scrubbing_pg_info()
+    scrubbing_pgs, count_shallow, count_deep = get_scrubbing_pg_info()
     reset_cursor()
     print(" " * 40 )
-    return scrubbing_pgs, cnt_shallow, cnt_deep
+    return scrubbing_pgs, count_shallow, count_deep
 
 def get_active_pgs(scrubbing_pgs, last_pg_run, idle_pgs):
     """
     Return a list of pgs that are actively scrubbing.  If a pg was scrubbing but the idle hasn't expired keep it active.
+
+    Args:
+        scrubbing_pgs (dict): Current scrubbing pgs.
+        last_pg_run (dict): Pgs that were scrubbing the last time we checked.
+        idle_pgs (dict): Pgs that are idle with the monotonic value of when it became idle.
+    Returns:
+        list: List of active scrubbing pgs.
     """
     active = {}
     for pgid, pg in scrubbing_pgs.items():
         if pgid in last_pg_run:
             # pg was active the last check so check the objected scrubbed has increased.
-            if pg['objects_scrubbed'] != last_pg_run[pgid]['objects_scrubbed']:
+            objects_scrubbed = pg['objects_scrubbed'] - last_pg_run[pgid]['objects_scrubbed']
+            scrub_time = (pg['data_time'] - last_pg_run[pgid]['data_time']) if (pg['data_time'] - last_pg_run[pgid]['data_time']) > 0 else 0.0;
+            pg['objects_per_sec'] = objects_scrubbed / scrub_time
+
+            if objects_scrubbed > 0:
+                # The number of objects scrubbed has increased so it is active.
                 active[pgid] = pg
                 pg['state'] = STAT_UP
                 if pgid in idle_pgs:
-                    # This pg has just started scrubbing so reset the idle count.
+                    # This pg has just started scrubbing so remove it from the idle list.
                     del idle_pgs[pgid]
             else:
                 # The number of objects scrubbed has not changed, so check if it has been idle for too long.
                 if not pgid in idle_pgs:
                     # This pg has just started scrubbing so add it to the idle list.
-                    idle_pgs[pgid] = 0
+                    idle_pgs[pgid] = time.monotonic();
 
-                if  idle_pgs[pgid] < 2:
-                    # The number of objects scrubbed has not changed and it hasn't been idle for too long, so keep it active.
-                    # This is to avoid showing pgs that have not scrubbed for a while.
-                    idle_pgs[pgid] += 1
+                if  time.monotonic() - idle_pgs[pgid] < IDLE_TIMEOUT:
+                    # The number of objects scrubbed has not changed and it hasn't been idle for too long, so keep it in the active list.
                     pg['state'] = STAT_IDLE
                     active[pgid] = pg
         else:
@@ -239,17 +284,26 @@ def get_active_pgs(scrubbing_pgs, last_pg_run, idle_pgs):
  
     return sorted(active.items(), key=lambda pg: pg[0])  # Sort by pgid
 
-def print_active_pgs(cnt_shallow, cnt_deep, active_pgs, tty_height=24, tty_width=80):
-    print(f"Shallow: {cnt_shallow:<5}  Deep: {cnt_deep:<5}  Active: {len(active_pgs):<5}")
+def print_active_pgs(count_shallow, count_deep, active_pgs, tty_height=24, tty_width=80):
+    """
+    Print the active scrubbing pgs to the terminal.
+    Args:
+        count_shallow (int): Number of shallow scrubs.
+        count_deep (int): Number of deep scrubs.
+        active_pgs (list): List of active scrubbing pgs.
+        tty_height (int): Height of the terminal.
+        tty_width (int): Width of the terminal.
+    """
+    print(f"Shallow: {count_shallow:<5}  Deep: {count_deep:<5}  Active: {len(active_pgs):<5}")
     print("\nActive Scrubbing");
-    print(f"\n{'PGID':<7}  {'Scrub Type':<10}  {'Total Objects':<13}  {'Objects Scrubbed':<16}  {'Percent':<8}  ")
+    print(f"\n{'PGID':<7}  {'Scrub Type':<10}  {'Total Objects':<13}  {'Objects Scrubbed':<16} {'Obj/s':<6} {'Percent':<8}  ")
     row = 6
     for pgid,pg in active_pgs:
         if row >= tty_height - 3:  # Leave space for the footer
             break
         if pg['total_objects']>0:
             percent = f"{(pg['objects_scrubbed'] / pg['total_objects'] * 100):.2f}%"
-            print(f"{pgid:<7}  {pg['scrub_type']:^10}  {pg['total_objects']:<13}  {pg['objects_scrubbed']:<16}  {percent:<8} {pg['state']}")
+            print(f"{pgid:<7}  {pg['scrub_type']:^10}  {pg['total_objects']:<13}  {pg['objects_scrubbed']:<16} {pg['objects_per_sec']:<6.3f}  {percent:<8} {pg['state']}")
             row += 1
 
     if row < tty_height - 3:
@@ -283,17 +337,24 @@ def main():
 
             # Loop fetching and displaying pg data.
             while True:
+                # Reset the cursor to the top left of the screen.
                 reset_cursor()
 
+                # Check if the terminal size has changed.  If it has, clear the screen.
+                cur_tty_size = shutil.get_terminal_size()
+                if cur_tty_size != tty_size:
+                    tty_size = cur_tty_size
+                    clear_screen()
+
                 # Get the pg info from ceph and find the pgs that are currently scrubbing.
-                scrubbing_pgs, cnt_shallow, cnt_deep = fetch_pg_data()
+                scrubbing_pgs, count_shallow, count_deep = fetch_pg_data()
                 # Trim the idle_pgs dictionary to remove pgs that are no longer scrubbing.
                 trim_idle_pgs(scrubbing_pgs, idle_pgs)
                 # Get the active pgs that are currently scrubbing.
                 active_pgs = get_active_pgs(scrubbing_pgs, last_pg_run, idle_pgs)
 
                 # Display the currently scrubbing pgs.
-                print_active_pgs(cnt_shallow, cnt_deep, active_pgs, tty_size.lines, tty_size.columns)
+                print_active_pgs(count_shallow, count_deep, active_pgs, tty_size.lines, tty_size.columns)
 
                 # Save the list just displayed.
                 last_pg_run = scrubbing_pgs
