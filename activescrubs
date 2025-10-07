@@ -48,13 +48,17 @@ import time
 import tty
 
 # Used to show if the number of objects scrubbed has increased.
-STAT_UP = '\u2191' # Unicode arrow up
-STAT_IDLE = '\u2190' # Unicode arrow left
-STAT_NONE = ' ' 
-#STAT_DOWN = '\u2191' # Unicode arrow down
-#STAT_RIGHT = '\u2192' # Unicode arrow right
+STAT_UP     = '\u2191'      # Unicode arrow up
+STAT_IDLE   = '\u2190'      # Unicode arrow left
+STAT_NONE   = ' '
+#STAT_DOWN  = '\u2191'      # Unicode arrow down
+#STAT_RIGHT = '\u2192'      # Unicode arrow right
 
 IDLE_TIMEOUT = 60  # Number of seconds a pg can be idle before it is no longer shown.
+
+# Global variables to calculate average objects per second.
+glob_disp_count = 0
+glob_tot_objs_per_sec = 0.0
 
 class NonBlockingConsole(object):
     """
@@ -108,7 +112,7 @@ def get_pg_status():
     except ValueError as e:  # JSONDecodeError
         print("Error parsing JSON output: {}".format(e))
         sys.exit(2)
-    except OSError:  # FileNotFoundError 
+    except OSError:  # FileNotFoundError
         print("Error: 'ceph' command not found. Make sure Ceph is installed and in PATH.")
         sys.exit(3)
 
@@ -154,7 +158,7 @@ def extract_scrub_info(pg_data, current_time=None):
     scrub_info = {'pgid': '', 'total_objects': 0, 'total_bytes': 0, 'objects_scrubbed': 0,
                   'scrub_time': None, 'deep_scrub_time': None, 'scrub_type': '', 'scrub_schedule': '',
                   'state': STAT_NONE, 'idle': 0, 'data_time': current_time, 'objects_per_sec': 0.0}
-    
+
     scrub_info['pgid'] = pg_data.get('pgid','')
 
     # Get objects info
@@ -232,7 +236,7 @@ def reset_cursor():
 def fetch_pg_data():
     """
     Fetch the scrubbing PGs from ceph and the number of shallow and deep scrubs.
-    
+
     Returns:
         tuple: (scrubbing_pgs (dict), count_shallow (int), count_deep (int))
     """
@@ -282,10 +286,11 @@ def get_active_pgs(scrubbing_pgs, last_pg_run, idle_pgs):
             # This pg has just appeared so add it to the active list.
             active[pgid] = pg
             pg['state'] = STAT_UP
- 
+
     return sorted(active.items(), key=lambda pg: pg[0])  # Sort by pgid
 
 def print_active_pgs(count_shallow, count_deep, active_pgs, tty_height=24, tty_width=80):
+
     """
     Print the active scrubbing pgs to the terminal.
     Args:
@@ -295,22 +300,37 @@ def print_active_pgs(count_shallow, count_deep, active_pgs, tty_height=24, tty_w
         tty_height (int): Height of the terminal.
         tty_width (int): Width of the terminal.
     """
-    print(f"Shallow: {count_shallow:<5}  Deep: {count_deep:<5}  Active: {len(active_pgs):<5}")
-    print("\nActive Scrubbing");
-    print(f"\n{'PGID':<7}  {'Scrub Type':<10}  {'Total Objects':<13}  {'Obj Scrubbed':<16} {'Obj/s':<6} {'Percent':<8}  ")
-    row = 6
+    # Calculate total number of pgs actively scrubbing and total objects per second.
+    tot_running = 0
     tot_objs_per_sec = 0.0
     for pgid,pg in active_pgs:
-        if row >= tty_height - 4:  # Leave space for the footer
+        if pg['total_objects']>0 and pg['objects_scrubbed']>0:
+            tot_running += 1
+            tot_objs_per_sec += pg['objects_per_sec']
+    
+    # Calculate the average objects per second
+    global glob_disp_count, glob_tot_objs_per_sec
+    glob_disp_count += 1
+    glob_tot_objs_per_sec += tot_objs_per_sec
+    avg_per_sec = glob_tot_objs_per_sec / glob_disp_count
+
+    # Print the header
+    print(f"Shallow: {count_shallow:<5}  Deep: {count_deep:<5}  Active: {len(active_pgs):<5} ")
+    print(f"Scrubbing: {tot_running:<5}  Obj/s: {int(tot_objs_per_sec):<5}   Avg Obj/s: {int(avg_per_sec):<5}")
+    print(f"\n{'':<7}  {'Scrub':^10}  {'Total':^10}  {'Obj':^10} ")
+    print(f"{'PGID':<7}  {'Type':^10}  {'Objects':^10}  {'Scrubbed':^10} {'Obj/s':<6} {'Percent':<8}  ")
+    row = 6
+
+            
+    for pgid,pg in active_pgs:
+        if row == tty_height - 4:  
+            # Leave space for the footer
             break
         # Ignore pgs with no objects to scrub or that haven't scrubbed any objects.
         if pg['total_objects']>0 and pg['objects_scrubbed']>0:
             percent = f"{(pg['objects_scrubbed'] / pg['total_objects'] * 100):.2f}%"
-            print(f"{pgid:<7}  {pg['scrub_type']:^10}  {pg['total_objects']:<13}  {pg['objects_scrubbed']:<16} {pg['objects_per_sec']:<6.3f}  {percent:<8} {pg['state']}")
+            print(f"{pgid:<7}  {pg['scrub_type']:^10}  {pg['total_objects']:<10}  {pg['objects_scrubbed']:<10} {pg['objects_per_sec']:<6.3f}  {percent:<8} {pg['state']}")
             row += 1
-            tot_objs_per_sec += pg['objects_per_sec']
-    print(f"\nTotal Objects/s: {tot_objs_per_sec:.3f}")
-    row += 2
 
     if row < tty_height - 4:
         # Fill the remaining lines with empty rows
@@ -366,7 +386,7 @@ def main():
                 last_pg_run = scrubbing_pgs
 
                 padding = ' ' * (tty_size.columns - 34)
-                print(f"Press 'q' to exit or ' ' to refresh. {padding}")
+                print(f"\nPress 'q' to exit or ' ' to refresh. {padding}",end="")
 
                 # Wait for refresh interval
                 timer= 0
