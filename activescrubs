@@ -57,7 +57,9 @@ STAT_NONE = ' '
 IDLE_TIMEOUT = 60  # Number of seconds a pg can be idle before it is no longer shown.
 
 class NonBlockingConsole(object):
-    """Context manager for non-blocking console input."""
+    """
+    Context manager for non-blocking console input.
+    """
     def __init__(self):
         self.old_settings = None
 
@@ -86,7 +88,7 @@ def get_pg_status():
         OSError: If the ceph command is not found.
     """
     try:
-        # Use Popen for Python 3.6 compatibility
+        # NOTE: Use Popen for Python 3.6 compatibility
         process = subprocess.Popen(
             ["ceph", "pg", "dump", "pgs", "-f", "json-pretty"],
             stdout=subprocess.PIPE,
@@ -105,10 +107,10 @@ def get_pg_status():
         sys.exit(1)
     except ValueError as e:  # JSONDecodeError
         print("Error parsing JSON output: {}".format(e))
-        sys.exit(1)
+        sys.exit(2)
     except OSError:  # FileNotFoundError 
         print("Error: 'ceph' command not found. Make sure Ceph is installed and in PATH.")
-        sys.exit(1)
+        sys.exit(3)
 
 def parse_timestamp(timestamp_str):
     """Parse Ceph timestamp format to datetime object."""
@@ -184,7 +186,7 @@ def get_scrubbing_pg_info():
 
     if not pg_stats:
         print("Error getting PG stats.")
-        sys.exit(1)
+        sys.exit(4)
 
     scrubbing_pgs = {}
     # Find PGs that are currently scrubbing
@@ -214,9 +216,8 @@ def hide_cursor():
 
 def show_cursor():
     """
-    Make the cursor visible again.
+    Make the cursor visible.
     """
-    # Show the cursor
     sys.stdout.write("\033[?25h")
     sys.stdout.flush()
 
@@ -296,17 +297,22 @@ def print_active_pgs(count_shallow, count_deep, active_pgs, tty_height=24, tty_w
     """
     print(f"Shallow: {count_shallow:<5}  Deep: {count_deep:<5}  Active: {len(active_pgs):<5}")
     print("\nActive Scrubbing");
-    print(f"\n{'PGID':<7}  {'Scrub Type':<10}  {'Total Objects':<13}  {'Objects Scrubbed':<16} {'Obj/s':<6} {'Percent':<8}  ")
+    print(f"\n{'PGID':<7}  {'Scrub Type':<10}  {'Total Objects':<13}  {'Obj Scrubbed':<16} {'Obj/s':<6} {'Percent':<8}  ")
     row = 6
+    tot_objs_per_sec = 0.0
     for pgid,pg in active_pgs:
-        if row >= tty_height - 3:  # Leave space for the footer
+        if row >= tty_height - 4:  # Leave space for the footer
             break
-        if pg['total_objects']>0:
+        # Ignore pgs with no objects to scrub or that haven't scrubbed any objects.
+        if pg['total_objects']>0 and pg['objects_scrubbed']>0:
             percent = f"{(pg['objects_scrubbed'] / pg['total_objects'] * 100):.2f}%"
             print(f"{pgid:<7}  {pg['scrub_type']:^10}  {pg['total_objects']:<13}  {pg['objects_scrubbed']:<16} {pg['objects_per_sec']:<6.3f}  {percent:<8} {pg['state']}")
             row += 1
+            tot_objs_per_sec += pg['objects_per_sec']
+    print(f"\nTotal Objects/s: {tot_objs_per_sec:.3f}")
+    row += 2
 
-    if row < tty_height - 3:
+    if row < tty_height - 4:
         # Fill the remaining lines with empty rows
         for _ in range(row, tty_height - 3):
             print(" " * tty_width)
