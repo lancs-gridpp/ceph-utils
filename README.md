@@ -7,6 +7,7 @@ Assorted BASH and Python command line scripts to either cut down the amount of t
 | --- | --- |
 | activescrubs | Show the PGs that are currently scrubbing with period updates. |
 | backfilling | Set/Unset the OSD backfilling flag and optionally mute the health warning OSDMAP_FLAGS |
+| bottleneck | Anyalize the specified osd numbers to see what things they have in common |
 | clientlist | Generate a list of clients connected using CephFS |
 | cluster_dump.sh | Export maps from the cluster to files. Usage: `cluster_dump.sh [-h] [-c <name>] <out options> [<prefix>]` |
 | endmaint | Takes `<hostname>` out of maintenance mode. Usage: `endmaint <hostname>` |
