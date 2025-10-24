@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# update-ceph-utils - Update ceph-utils repository and manage symbolic links
+
+set -e  # Exit on any error
+
+CEPH_UTILS_DIR="/usr/local/share/ceph-utils"
+BIN_DIR="/usr/local/bin"
+
+# Check if ceph-utils directory exists
+if [[ ! -d "$CEPH_UTILS_DIR" ]]; then
+    echo "Error: Directory $CEPH_UTILS_DIR does not exist"
+    exit 1
+fi
+
+# Check if we can write to the bin directory
+if [[ ! -w "$BIN_DIR" ]]; then
+    echo "Error: Cannot write to $BIN_DIR (try running with sudo)"
+    exit 1
+fi
+
+echo "Updating ceph-utils repository..."
+cd "$CEPH_UTILS_DIR"
+
+# Pull latest changes from git
+if ! git pull; then
+    echo "Error: Failed to update git repository"
+    exit 1
+fi
+
+echo "Managing symbolic links..."
+
+# Remove broken symbolic links that point to ceph-utils
+echo "Removing broken symbolic links..."
+for link in "$BIN_DIR"/*; do
+    if [[ -L "$link" ]]; then
+        target=$(readlink "$link")
+        # Check if the link points to ceph-utils directory and the target doesn't exist
+        if [[ "$target" == "$CEPH_UTILS_DIR"/* ]] && [[ ! -e "$target" ]]; then
+            echo "  Removing broken link: $(basename "$link")"
+            rm "$link"
+        fi
+    fi
+done
+
+# Create symbolic links for executable files in ceph-utils
+echo "Creating symbolic links for new executables..."
+for file in "$CEPH_UTILS_DIR"/*; do
+    if [[ -f "$file" && -x "$file" ]]; then
+        filename=$(basename "$file")
+        link_path="$BIN_DIR/$filename"
+        
+        # Only create link if it doesn't already exist
+        if [[ ! -e "$link_path" ]]; then
+            echo "  Creating link: $filename -> $file"
+            ln -s "$file" "$link_path"
+        fi
+    fi
+done
+
+echo "Update completed successfully!"
+
+# Show current symbolic links pointing to ceph-utils
+echo ""
+echo "Current ceph-utils symbolic links in $BIN_DIR:"
+for link in "$BIN_DIR"/*; do
+    if [[ -L "$link" ]]; then
+        target=$(readlink "$link")
+        if [[ "$target" == "$CEPH_UTILS_DIR"/* ]]; then
+            echo "  $(basename "$link") -> $target"
+        fi
+    fi
+done
