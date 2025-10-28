@@ -1,0 +1,256 @@
+#!/usr/bin/python3
+
+#---------------------------------------------------------------------------------
+# Copyright (c) 2025 Lancaster University
+# Written by: Gerard Hand
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#---------------------------------------------------------------------------------
+#
+# Usage: activescrubs
+#
+# Show the pgs that are active scrubbing with automatic period updates.
+#
+# Things to do:
+# * If an active scrub doesn't update the number of objects scrubbed on a refresh
+#   it continues to be shown as active for an 'idle' period.  This is currently
+#   based on the number of refreshes done since it stopped updating the number of
+#   objects scrubbed.  This might be better being a timebased idle period.
+# * include versioning.
+
+
+from datetime import datetime, timedelta
+import json
+import os
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+# Used to show if the number of objects scrubbed has increased.
+STAT_UP     = '\u2191'      # Unicode arrow up
+STAT_IDLE   = '\u2190'      # Unicode arrow left
+STAT_NONE   = ' '
+#STAT_DOWN  = '\u2191'      # Unicode arrow down
+#STAT_RIGHT = '\u2192'      # Unicode arrow right
+
+IDLE_TIMEOUT = 60  # Number of seconds a pg can be idle before it is no longer shown.
+
+# Global variables to calculate average objects per second.
+glob_disp_count = 0
+glob_tot_objs_per_sec = 0.0
+glob_sort_column = 8
+
+class NonBlockingConsole(object):
+    """
+    Context manager for non-blocking console input.
+    """
+    def __init__(self):
+        self.old_settings = None
+
+    def __enter__(self):
+        self.old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+        return self
+
+    def __exit__(self, type, value, traceback):
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+
+
+    def get_data(self):
+        if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
+            return sys.stdin.read(1)
+        return False
+
+def clear_screen():
+    os.system('clear')
+
+def hide_cursor():
+    # Hide the cursor
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+
+def show_cursor():
+    """
+    Make the cursor visible.
+    """
+    sys.stdout.write("\033[?25h")
+    sys.stdout.flush()
+
+def reset_cursor():
+    """
+    Move the cursor to the top left corner of the terminal.
+    """
+    # Move the cursor to the top left corner
+    sys.stdout.write("\033[H")
+    sys.stdout.flush()
+
+def get_active_mds():
+    try:
+        # Run the Ceph command to get FS status
+        result = subprocess.run(['ceph', 'fs', 'status', '--format=json'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+        # Check if the command executed successfully
+        if result.returncode != 0:
+            print("Error executing Ceph command: {}".format(result.stderr))
+            return None
+
+        # Parse the JSON output
+        fs_status = json.loads(result.stdout)
+
+        # Find the active MDS from the mdsmap
+        active_mds = ""
+
+        for mds in fs_status.get('mdsmap', []):
+            if mds.get('state') == 'active':  # Look for active MDS
+                active_mds = mds.get('name')
+                break
+
+        # Return the active MDS
+        return active_mds
+
+    except Exception as e:
+        print("Error: {}".format(str(e)))
+        return None
+
+
+def get_client_list(active_mds):
+    try:
+        # Run the Ceph command to get list of sessions
+        result = subprocess.run(['ceph', 'tell', 'mds.'+active_mds, 'client', 'ls', '--format=json'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        client_json = json.loads(result.stdout)
+
+        clients = []
+
+        for client in client_json:
+            clients.append((
+                client['id'],
+                client['client_metadata']['hostname'],
+                client['entity']['addr']['addr'],
+                client['entity']['name']['type'],
+                client['state'],
+                client['num_leases'],
+                client['num_caps'],
+                client['requests_in_flight'],
+                client['request_load_avg'],
+                client['client_metadata']['root']
+            ))
+
+        global glob_sort_column
+        clients.sort(key=lambda x: x[glob_sort_column], reverse=True)
+
+        return clients
+
+    except Exception as e:
+        print("Error: {}".format(str(e)))
+        return None
+
+
+def get_client_data():
+    mds = get_active_mds()
+
+    if mds is not None:
+        clients = get_client_list(mds)
+    else:
+        clients = []
+    return clients
+
+def print_data(height, width, clients):
+    print(f"{'ID':^7}  {'Host':^10}  {'State':^6}  {'Leases':^6}  {'Caps':^7}  {'In Flight':^9}  {'Load Avg':<8}  ")
+    row = 1;
+    for client in clients:
+        if row>=height-4:
+            break;
+        print(f"{client[0]:<7}  {client[1]:^10.10}  {client[4]:^6}  {client[5]:<6}  {client[6]:<7}  {client[7]:<9}  {client[8]:<8}  ")
+        row += 1
+
+    if row < height - 4:
+        # Fill the remaining lines with empty rows
+        for _ in range(row, height - 3):
+            print(" " * width)
+            row += 1
+
+
+
+def main():
+    # Get the terminal size to adjust output accordingly.
+    tty_size = shutil.get_terminal_size()
+
+    try:
+        # Blank the screen and hide the cursor.
+        hide_cursor()
+        clear_screen()
+
+        # Use NonBlockingConsole to read key presses
+        with NonBlockingConsole() as nbc:
+
+            # Loop fetching and displaying pg data.
+            while True:
+                # Reset the cursor to the top left of the screen.
+                reset_cursor()
+
+                # Check if the terminal size has changed.  If it has, clear the screen.
+                cur_tty_size = shutil.get_terminal_size()
+                if cur_tty_size != tty_size:
+                    tty_size = cur_tty_size
+                    clear_screen()
+
+                # Get the client data.
+                clients = get_client_data()
+
+                # Display the 
+                print_data(tty_size.lines, tty_size.columns, clients)
+
+
+                padding = ' ' * (tty_size.columns - 34)
+                print(f"\nPress 'q' to exit or ' ' to refresh. {padding}",end="")
+
+                # Wait for refresh interval
+                timer= 0
+                incr = 0.2
+                while timer<4:
+                    key = nbc.get_data()
+                    
+                    if isinstance(key,str):
+                        if key == 'q':  # x1b is ESC
+                            raise KeyboardInterrupt
+                        elif key == ' ':
+                            break
+                        elif key in "1234567":
+                            key_map = {'1': 0, '2': 1, '3': 4, '4': 5, '5': 6, '6': 7, '7': 8}
+                            global glob_sort_column
+                            glob_sort_column = key_map[key]
+                            break
+                    time.sleep(incr)
+                    timer += incr
+
+    except KeyboardInterrupt:
+#        clear_screen()  # TODO: Uncomment
+        print('Exiting')
+
+    show_cursor()
+
+if __name__ == "__main__":
+    main()
