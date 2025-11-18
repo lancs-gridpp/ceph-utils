@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+
+#---------------------------------------------------------------------------------
+# Copyright (c) 2025 Lancaster University
+# Written by: Gerard Hand
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#---------------------------------------------------------------------------------
+#
+# usage: scrubsched
+#
+#   This script identifies which PGs are due for scrubbing in the current round
+#   and predicts when the next scrubbing round will start.
+#
+
+
+import json
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple
+
+
+def run_ceph_command(cmd: List[str]) -> Dict:
+    """Execute a ceph command and return JSON output."""
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            check=True
+        )
+        return json.loads(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing command: {' '.join(cmd)}", file=sys.stderr)
+        print(f"Error: {e.stderr}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON output: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_scrub_config() -> Dict[str, float]:
+    """Retrieve scrubbing configuration parameters."""
+    config_params = [
+        'osd_scrub_min_interval',
+        'osd_scrub_max_interval',
+        'osd_deep_scrub_interval',
+        'osd_scrub_interval_randomize_ratio'
+    ]
+
+    config = {}
+    for param in config_params:
+        cmd = ['ceph', 'config', 'get', 'osd', param, '-f', 'json']
+        result = run_ceph_command(cmd)
+        # Handle both dict and direct value responses
+        if isinstance(result, dict):
+            config[param] = float(result.get(param, result.get('value', 0)))
+        else:
+            config[param] = float(result)
+
+    return config
+
+
+def get_pg_stats() -> List[Dict]:
+    """Retrieve PG statistics including scrub timestamps."""
+    cmd = ['ceph', 'pg', 'dump', '-f', 'json']
+    data = run_ceph_command(cmd)
+    if 'pg_stats' in data:
+        return data['pg_stats']
+    elif 'pg_map' in data and 'pg_stats' in data['pg_map']:
+        return data['pg_map']['pg_stats']
+    elif 'pg_stat_sum' in data:
+        # Older format, try to extract from different structure
+        return data.get('pg_stat_sum', [])
+    else:
+        # Debug: print available keys
+        print(f"Warning: Unexpected pg dump format. Available keys: {list(data.keys())}", file=sys.stderr)
+        print(f"Trying to find pg stats in data structure...", file=sys.stderr)
+
+        # Try to find any list of PG stats
+        for key, value in data.items():
+            if isinstance(value, list) and len(value) > 0:
+                if isinstance(value[0], dict) and 'pgid' in value[0]:
+                    print(f"Found PG stats under key: {key}", file=sys.stderr)
+                    return value
+
+        return []
+
+
+def parse_timestamp(ts_str: str) -> datetime:
+    """Parse Ceph timestamp string to datetime object."""
+    # Ceph timestamps are typically in format: "2024-11-11 10:30:45.123456"
+    try:
+        return datetime.strptime(ts_str.split('.')[0], '%Y-%m-%dT%H:%M:%S')
+    except ValueError:
+        # Try alternative format without microseconds
+        return datetime.strptime(ts_str, '%Y-%m-%dT%H:%M:%S')
+
+
+def calculate_next_scrub(last_scrub: datetime, last_deep_scrub: datetime,
+                         config: Dict[str, float], current_time: datetime) -> Tuple[datetime, datetime]:
+    """Calculate when the next scrub and deep scrub are due."""
+    min_interval = config['osd_scrub_min_interval']
+    max_interval = config['osd_scrub_max_interval']
+    deep_interval = config['osd_deep_scrub_interval']
+
+    # Next regular scrub (based on max interval)
+    next_scrub = last_scrub + timedelta(seconds=max_interval)
+
+    # Next deep scrub
+    next_deep_scrub = last_deep_scrub + timedelta(seconds=deep_interval)
+
+    return next_scrub, next_deep_scrub
+
+
+def analyze_pgs(pg_stats: List[Dict], config: Dict[str, float]) -> Tuple[List[Dict], datetime]:
+    """Analyze PGs to determine which are due for scrubbing."""
+    current_time = datetime.now()
+    pgs_due_for_scrub = []
+    pgs_due_for_deep_scrub = []
+    next_round_starts = []
+
+    min_interval = config['osd_scrub_min_interval']
+    max_interval = config['osd_scrub_max_interval']
+    deep_interval = config['osd_deep_scrub_interval']
+
+    for pg in pg_stats:
+        pgid = pg['pgid']
+
+        # Parse timestamps
+        last_scrub_stamp = parse_timestamp(pg['last_scrub_stamp'])
+        last_deep_scrub_stamp = parse_timestamp(pg['last_deep_scrub_stamp'])
+
+        # Calculate time since last scrubs
+        time_since_scrub = (current_time - last_scrub_stamp).total_seconds()
+        time_since_deep_scrub = (current_time - last_deep_scrub_stamp).total_seconds()
+
+        # Check if due for regular scrub (exceeded max interval)
+        if time_since_scrub >= max_interval:
+            next_scrub, next_deep = calculate_next_scrub(
+                last_scrub_stamp, last_deep_scrub_stamp, config, current_time
+            )
+            pgs_due_for_scrub.append({
+                'pgid': pgid,
+                'last_scrub': last_scrub_stamp,
+                'time_overdue': time_since_scrub - max_interval,
+                'next_scrub': next_scrub,
+                'type': 'regular'
+            })
+
+        # Check if due for deep scrub
+        if time_since_deep_scrub >= deep_interval:
+            next_scrub, next_deep = calculate_next_scrub(
+                last_scrub_stamp, last_deep_scrub_stamp, config, current_time
+            )
+            pgs_due_for_deep_scrub.append({
+                'pgid': pgid,
+                'last_deep_scrub': last_deep_scrub_stamp,
+                'time_overdue': time_since_deep_scrub - deep_interval,
+                'next_deep_scrub': next_deep,
+                'type': 'deep'
+            })
+
+        # Calculate when next scrub round will start for this PG
+        next_scrub_time = last_scrub_stamp + timedelta(seconds=max_interval)
+        if next_scrub_time > current_time:
+            next_round_starts.append(next_scrub_time)
+
+    # Determine earliest next scrub round
+    next_round = min(next_round_starts) if next_round_starts else current_time
+
+    # Combine and deduplicate (deep scrubs take priority)
+    all_pgs_due = {}
+    for pg in pgs_due_for_scrub:
+        all_pgs_due[pg['pgid']] = pg
+    for pg in pgs_due_for_deep_scrub:
+        all_pgs_due[pg['pgid']] = pg  # Overwrites if exists
+
+    return list(all_pgs_due.values()), next_round
+
+
+def main():
+    """Main function to analyze and display scrubbing schedule."""
+    print("=" * 70)
+    print("Ceph PG Scrubbing Schedule Analyzer")
+    print("=" * 70)
+    print()
+
+    # Get configuration
+    print("Retrieving scrubbing configuration...")
+    config = get_scrub_config()
+
+    print("\nScrubbing Configuration:")
+    print(f"  Min Interval:      {config['osd_scrub_min_interval'] / 86400:.2f} days")
+    print(f"  Max Interval:      {config['osd_scrub_max_interval'] / 86400:.2f} days")
+    print(f"  Deep Scrub Int:    {config['osd_deep_scrub_interval'] / 86400:.2f} days")
+    print(f"  Randomize Ratio:   {config['osd_scrub_interval_randomize_ratio']}")
+    print()
+
+    # Get PG stats
+    print("Retrieving PG statistics...")
+    pg_stats = get_pg_stats()
+    print(f"Total PGs: {len(pg_stats)}")
+    print()
+
+    # Analyze PGs
+    print("Analyzing scrubbing schedule...")
+    pgs_due, next_round = analyze_pgs(pg_stats, config)
+
+    # Display results
+    print("=" * 70)
+    print("PGs Due for Scrubbing in Current Round")
+    print("=" * 70)
+
+    if pgs_due:
+        # Sort by overdue time
+        pgs_due.sort(key=lambda x: x.get('time_overdue', 0), reverse=True)
+
+        print(f"\nTotal PGs due for scrubbing: {len(pgs_due)}")
+        print()
+
+        for pg in pgs_due[:20]:  # Show top 20 most overdue
+            pgid = pg['pgid']
+            scrub_type = pg['type']
+            overdue = pg.get('time_overdue', 0)
+            overdue_hours = overdue / 3600
+
+            if scrub_type == 'regular':
+                last_time = pg['last_scrub']
+            else:
+                last_time = pg['last_deep_scrub']
+
+            print(f"  PG: {pgid:15s} | Type: {scrub_type:8s} | "
+                  f"Overdue: {overdue_hours:6.2f}h | "
+                  f"Last: {last_time}")
+
+        if len(pgs_due) > 20:
+            print(f"\n  ... and {len(pgs_due) - 20} more PGs")
+    else:
+        print("\nNo PGs are currently overdue for scrubbing.")
+
+    print()
+    print("=" * 70)
+    print("Next Scrubbing Round")
+    print("=" * 70)
+    print(f"\nNext round will start at: {next_round}")
+
+    time_until = next_round - datetime.now()
+    hours_until = time_until.total_seconds() / 3600
+    print(f"Time until next round:    {hours_until:.2f} hours")
+    print()
+
+
+if __name__ == '__main__':
+    main()

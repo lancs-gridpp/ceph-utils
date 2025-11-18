@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+CephFS Client Monitor
+Tracks CephFS client connections and reports on changes.
+"""
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from collections import defaultdict
+
+
+class CephFSMonitor:
+    def __init__(self, db_path='~/.config/ceph-utils/cephfs_clients.db'):
+        self.db_path = os.path.expanduser(db_path)
+        db_directory = os.path.dirname(self.db_path)
+        os.makedirs(db_directory, exist_ok=True)        
+        self.init_database()
+    
+    def init_database(self):
+        """ Make sure the database exists """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS hosts (
+                hostname TEXT PRIMARY KEY,
+                num_mounts INT,
+                first_seen TIMESTAMP,
+                last_seen TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    
+    def get_cephfs_clients(self):
+        """Get current CephFS clients from ceph command."""
+        try:
+            # Run ceph command to get client sessions
+            result = subprocess.run(
+                ['ceph', 'tell', 'mds.*', 'client', 'ls', '--format=json'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                check=True
+            )
+            
+            # Parse JSON output
+            data = json.loads(result.stdout)
+            return data
+        except subprocess.CalledProcessError as e:
+            print("Error running ceph command:", e, file=sys.stderr)
+            print("stderr:", e.stderr, file=sys.stderr)
+            sys.exit(1)
+        except json.JSONDecodeError as e:
+            print("Error parsing ceph output:", e, file=sys.stderr)
+            sys.exit(1)
+
+    def get_active_mds(self):
+        try:
+            # Run the Ceph command to get FS status
+            result = subprocess.run(['ceph', 'fs', 'status', '--format=json'],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+            # Check if the command executed successfully
+            if result.returncode != 0:
+                print("Error executing Ceph command: {}".format(result.stderr))
+                return None
+
+            # Parse the JSON output
+            fs_status = json.loads(result.stdout)
+
+            # Find the active MDS from the mdsmap
+            active_mds = ""
+
+            for mds in fs_status.get('mdsmap', []):
+                if mds.get('state') == 'active':  # Look for active MDS
+                    active_mds = mds.get('name')
+                    break
+
+            # Return the active MDS
+            return active_mds
+
+        except Exception as e:
+            print("Error: {}".format(str(e)))
+            return None
+    
+    def get_session_list(self,active_mds):
+        try:
+            # Run the Ceph command to get list of sessions
+            result = subprocess.run(['ceph', 'tell', 'mds.'+active_mds, 'session', 'ls', '--format=json'],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            sessions_json = json.loads(result.stdout)
+
+            sessions = []
+
+            for session in sessions_json:
+                sessions.append((
+                    session['id'],
+                    session['entity']['addr']['addr'],
+                    session['client_metadata']['hostname'],
+                    session['state'],
+                    session['num_caps'],
+                    session['num_leases'],
+                    session['client_metadata']['kernel_version'],
+                    session['client_metadata']['root']
+
+                ))
+
+            return sessions
+
+        except Exception as e:
+            print("Error: {}".format(str(e)))
+            return None
+    
+    def parse_sessions(self, sessions_data):
+            """Parse the session data and extract hostnames with session counts."""
+            # Group sessions by hostname
+            hostname_sessions = defaultdict(int)
+            
+            for session in sessions_data:
+                hostname = session[2]
+                hostname_sessions[hostname] += 1
+            
+            return hostname_sessions
+    
+    def get_known_hosts(self):
+        """Retrieve all known hosts from database."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT hostname FROM hosts')
+        hosts = set(row[0] for row in cursor.fetchall())
+        conn.close()
+        return hosts
+
+    def get_host_mounts(self, hostname):
+        """ Retrieve the number of mounts for a specified hostname. """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT num_mounts 
+                    FROM hosts 
+                    WHERE hostname = ?
+                """, (hostname,))
+                
+                result = cursor.fetchone()
+                # print("Hostname: {}, Expected: {}".format(hostname,result[0]))
+                return result[0] if result else 0
+        
+        except sqlite3.Error as e:
+            # Handle any database-related errors
+            print(f"Database error: {e}")
+            return 0
+        except Exception as e:
+            # Handle any other unexpected errors
+            print(f"An error occurred: {e}")
+            return 0
+
+    def update_database2(self, hostname_sessions):
+        """Update database with current hosts."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        
+        for key, value in hostname_sessions.items():
+            sql = '''
+                INSERT INTO hosts (hostname, num_mounts, first_seen, last_seen)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(hostname) DO UPDATE SET last_seen = ?, num_mounts = MAX(num_mounts,?)
+            '''
+            params = (key, value, now, now, now, value)
+            
+            # Replace placeholders with actual values for display
+            display_sql = sql
+            for param in params:
+                if isinstance(param, str):
+                    display_sql = display_sql.replace('?', f"'{param}'", 1)
+                else:
+                    display_sql = display_sql.replace('?', str(param), 1)
+            
+            print(f"Executing SQL:\n{display_sql.strip()}\n")
+            
+            cursor.execute(sql, params)
+        
+        conn.commit()
+        conn.close()
+
+    def update_database(self, hostname_sessions):
+        """Update database with current hosts."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        
+        for key,value in hostname_sessions.items():
+            cursor.execute('''
+                INSERT INTO hosts (hostname, num_mounts, first_seen, last_seen)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(hostname) DO UPDATE SET last_seen = ?, num_mounts = MAX(num_mounts,?)
+            ''', (key, value, now, now, now, value))
+        
+        conn.commit()
+        conn.close()
+    
+    def check_and_report(self):
+        active_mds = self.get_active_mds()
+        if active_mds:
+            # Get current clients
+            session_list = self.get_session_list(active_mds)
+            hostname_sessions = self.parse_sessions(session_list)
+            current_hosts = set(hostname_sessions.keys())
+        
+            # Get previously known hosts
+            known_hosts = self.get_known_hosts()
+        
+            # Identify new and missing hosts
+            new_hosts = current_hosts - known_hosts
+            missing_hosts = known_hosts - current_hosts
+        
+            print("Connected Hosts: {}".format(len(current_hosts)))
+            
+            if new_hosts:
+                print("\nNEW HOSTS DETECTED: {}".format(len(new_hosts)))
+                for hostname in sorted(new_hosts):
+                    print("  + {} ({} session(s))".format(hostname, hostname_sessions[hostname]))
+        
+            if missing_hosts:
+                print("\nMISSING HOSTS: {}".format(len(missing_hosts)))
+                for hostname in sorted(missing_hosts):
+                    print("  - {}".format(hostname))
+        
+            # Check 'comp' hosts for required 2 sessions
+            comp_issues = []
+            for hostname, session_count in hostname_sessions.items():
+                expected = self.get_host_mounts(hostname)
+                if session_count != expected:
+                    comp_issues.append((hostname, session_count, expected))
+        
+            if comp_issues:
+                print("WARNING: hosts with incorrect session count:")
+                for hostname, count, expected in sorted(comp_issues):
+                    print("- {} has {} session(s) (expected {})".format(hostname, count, expected))
+            
+            # print("=" * 60)
+            
+            # Update database
+            self.update_database(hostname_sessions)
+
+
+def main():
+    monitor = CephFSMonitor()
+    monitor.check_and_report()
+
+
+if __name__ == '__main__':
+    main()
