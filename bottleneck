@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 
+#
 # Copyright (c) 2025 Lancaster University
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -23,7 +23,7 @@
 # Written by: Gerard Hand
 #
 # --------------------------------------------------------------------------------------------------------
-# 
+#
 # Ceph OSD Bottleneck Analyzer to analyze a list of OSDs and identify potential bottlenecks in a Ceph cluster.
 #
 # - Host concentration detection
@@ -49,14 +49,14 @@ class CephOSDAnalyzer:
         self.osd_tree = {}
         self.pg_data = {}
         self.bottlenecks = []
-        
+
     def run_ceph_command(self, cmd):
         """Execute a ceph command and return JSON output.
 
         Args:
             cmd: List of command arguments, e.g. ['ceph', 'osd', 'metadata', '1']
 
-        Returns 
+        Returns
             dict: parsed JSON output or empty dict on error.
 
         Raises:
@@ -78,7 +78,7 @@ class CephOSDAnalyzer:
         except json.JSONDecodeError as e:
             print("Error parsing JSON output: {}".format(e), file=sys.stderr)
             return {}
-    
+
     def get_osd_metadata(self):
         """Collect metadata for all OSDs."""
         print("Reading OSD metadata...")
@@ -86,36 +86,39 @@ class CephOSDAnalyzer:
             metadata = self.run_ceph_command(['ceph', 'osd', 'metadata', str(osd_id)])
             if metadata:
                 self.osd_metadata[osd_id] = metadata
-    
+
     def get_osd_tree(self):
         """Get the OSD tree structure."""
         print("Reading OSD tree...")
         self.osd_tree = self.run_ceph_command(['ceph', 'osd', 'tree'])
-    
+
     def get_pg_data(self):
         """Get PG mapping data."""
         print("Reading PG data...")
         pg_dump = self.run_ceph_command(['ceph', 'pg', 'dump'])
-        if 'pg_stats' in pg_dump:
-            for pg in pg_dump['pg_stats']:
-                pgid = pg['pgid']
-                acting = pg.get('acting', [])
-                up = pg.get('up', [])
-                self.pg_data[pgid] = {
-                    'acting': acting,
-                    'up': up,
-                    'state': pg.get('state', '')
-                }
-    
+
+        # ceph pg dump JSON wraps everything under 'pg_map'
+        pg_stats = pg_dump.get('pg_map', pg_dump).get('pg_stats', [])
+
+        for pg in pg_stats:
+            pgid = pg['pgid']
+            acting = pg.get('acting', [])
+            up = pg.get('up', [])
+            self.pg_data[pgid] = {
+                'acting': acting,
+                'up': up,
+                'state': pg.get('state', '')
+            }
+
     def analyze_host_distribution(self):
         """Check if OSDs are concentrated on few hosts."""
         host_map = defaultdict(list)
-        
+
         for osd_id in self.osd_list:
             if osd_id in self.osd_metadata:
                 hostname = self.osd_metadata[osd_id].get('hostname', 'unknown')
                 host_map[hostname].append(osd_id)
-        
+
         # Check for concentration
         total_osds = len(self.osd_list)
         for hostname, osds in host_map.items():
@@ -127,17 +130,17 @@ class CephOSDAnalyzer:
                     'description': "{} OSDs ({:.1f}%) are on host '{}'".format(len(osds), percentage, hostname),
                     'details': {'hostname': hostname, 'osds': osds, 'percentage': percentage}
                 })
-        
+
         return host_map
-    
+
     def analyze_rack_distribution(self):
         """Check if OSDs are in the same rack."""
         if not self.osd_tree or 'nodes' not in self.osd_tree:
             return
-        
+
         rack_map = defaultdict(list)
         osd_to_rack = {}
-        
+
         # Build rack mapping
         for node in self.osd_tree.get('nodes', []):
             if node['type'] == 'rack':
@@ -150,11 +153,11 @@ class CephOSDAnalyzer:
                                 for osd_id in child_node.get('children', []):
                                     if osd_id >= 0:  # Negative IDs are buckets
                                         osd_to_rack[osd_id] = rack_name
-        
+
         for osd_id in self.osd_list:
             if osd_id in osd_to_rack:
                 rack_map[osd_to_rack[osd_id]].append(osd_id)
-        
+
         # Check for concentration
         total_osds = len(self.osd_list)
         for rack_name, osds in rack_map.items():
@@ -166,49 +169,53 @@ class CephOSDAnalyzer:
                     'description': "{} OSDs ({:.1f}%) are in rack '{}'".format(len(osds), percentage, rack_name),
                     'details': {'rack': rack_name, 'osds': osds, 'percentage': percentage}
                 })
-    
+
     def analyze_pg_overlap(self):
         """Identify PGs that contain multiple OSDs from the list."""
         pg_overlap = defaultdict(list)
-        
+
         for pgid, pg_info in self.pg_data.items():
             acting_osds = pg_info['acting']
             overlap = [osd for osd in acting_osds if osd in self.osd_list]
-            
-            if len(overlap) > 1:
+
+            if len(overlap) > 2:
                 pg_overlap[pgid] = {
                     'osds': overlap,
                     'count': len(overlap),
                     'state': pg_info['state']
                 }
-        
+
         if pg_overlap:
             total_affected_pgs = len(pg_overlap)
             max_overlap = max(pg['count'] for pg in pg_overlap.values())
-            
             severity = 'HIGH' if max_overlap > 2 else 'MEDIUM'
+            pg_details = ''
+            for pgid, pg_info in pg_overlap.items():
+                pg_details += f"\n{pgid}: {pg_info['osds']}"
+
             self.bottlenecks.append({
                 'type': 'PG_OVERLAP',
                 'severity': severity,
-                'description': "{} PGs contain multiple OSDs from the list (max {} OSDs per PG)".format(total_affected_pgs, max_overlap),
-                'details': {
-                    'affected_pgs': total_affected_pgs,
-                    'max_overlap': max_overlap,
-                    'sample_pgs': dict(list(pg_overlap.items())[:5])  # Show first 5
-                }
+                'description': f"{total_affected_pgs} PGs contain multiple OSDs from the list (max {max_overlap} OSDs per PG)",
+                # 'details': {
+                #     'affected_pgs': total_affected_pgs,
+                #     'max_overlap': max_overlap,
+                #     'pgs': dict(list(pg_overlap.items())[:5])  # Show first 5
+                # }
+                'details': {'pgs': pg_details}
             })
-        
+
         return pg_overlap
-    
+
     def analyze_device_class(self):
         """Check if all OSDs are of the same device class."""
         device_classes = Counter()
-        
+
         for osd_id in self.osd_list:
             if osd_id in self.osd_metadata:
                 device_class = self.osd_metadata[osd_id].get('device_class', 'unknown')
                 device_classes[device_class] += 1
-        
+
         if len(device_classes) == 1:
             device_class = list(device_classes.keys())[0]
             self.bottlenecks.append({
@@ -217,18 +224,18 @@ class CephOSDAnalyzer:
                 'description': "All OSDs are of device class '{}'".format(device_class),
                 'details': {'device_class': device_class}
             })
-    
+
     def analyze_disk_backend(self):
         """Check if OSDs share the same backing disk."""
         disk_map = defaultdict(list)
-        
+
         for osd_id in self.osd_list:
             if osd_id in self.osd_metadata:
                 # Check for backing device
-                backend = self.osd_metadata[osd_id].get('backend_filestore_dev_node', 
+                backend = self.osd_metadata[osd_id].get('backend_filestore_dev_node',
                          self.osd_metadata[osd_id].get('bluestore_bdev_dev_node', 'unknown'))
                 disk_map[backend].append(osd_id)
-        
+
         # Check for OSDs sharing disks
         for disk, osds in disk_map.items():
             if len(osds) > 1 and disk != 'unknown':
@@ -238,48 +245,48 @@ class CephOSDAnalyzer:
                     'description': "{} OSDs share the same backing disk: {}".format(len(osds), disk),
                     'details': {'disk': disk, 'osds': osds}
                 })
-    
+
     def analyze_network_interface(self):
         """Check if OSDs share network characteristics."""
         # For now, we check if they're on the same host and assume a shared network
         # TODO: Implement network interface analysis
         pass
-    
+
     def analyze(self):
         print("Analyzing OSDs: {}".format(self.osd_list))
 
-        # Grab the necessary data        
+        # Grab the necessary data
         self.get_osd_metadata()
         self.get_osd_tree()
         self.get_pg_data()
-        
+
         # Find things the osds have in common
         self.analyze_host_distribution()
         self.analyze_rack_distribution()
         self.analyze_pg_overlap()
         self.analyze_device_class()
         self.analyze_disk_backend()
-        
+
         # Output the results
         self.print_report()
-    
+
     def print_report(self):
         """Print the analysis report."""
         print("\n" + "="*60)
         print("BOTTLENECK REPORT")
         print("="*60 + "\n")
-        
+
         if not self.bottlenecks:
             print("✓ No significant bottlenecks detected!\n")
             return
-        
+
         # Sort by severity
         severity_order = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2, 'INFO': 3}
         sorted_bottlenecks = sorted(
-            self.bottlenecks, 
+            self.bottlenecks,
             key=lambda x: severity_order.get(x['severity'], 99)
         )
-        
+
         for i, bottleneck in enumerate(sorted_bottlenecks, 1):
             severity_icon = {
                 'HIGH': '🔴',
@@ -287,10 +294,10 @@ class CephOSDAnalyzer:
                 'LOW': '🟢',
                 'INFO': 'ℹ️'
             }.get(bottleneck['severity'], '•')
-            
+
             print("{}. {} [{}] {}".format(i, severity_icon, bottleneck['severity'], bottleneck['type']))
             print("   {}".format(bottleneck['description']))
-            
+
             if bottleneck.get('details'):
                 print("   Details:")
                 for key, value in bottleneck['details'].items():
@@ -301,11 +308,11 @@ class CephOSDAnalyzer:
                     else:
                         print("     {}: {}".format(key, value))
             print()
-        
+
         # Summary
         high_severity = sum(1 for b in self.bottlenecks if b['severity'] == 'HIGH')
         medium_severity = sum(1 for b in self.bottlenecks if b['severity'] == 'MEDIUM')
-        
+
         print("="*60)
         print("SUMMARY: {} potential bottleneck(s) identified".format(len(self.bottlenecks)))
         if high_severity:
@@ -320,13 +327,13 @@ def main():
         print("Usage: bottleneck <osd1> <osd2> <osd3> ...")
         print("Example: bottleneck 1 5 12 15")
         sys.exit(1)
-    
+
     try:
         osd_list = [int(osd) for osd in sys.argv[1:]]
     except ValueError:
         print("Error: All arguments must be valid OSD numbers", file=sys.stderr)
         sys.exit(2)
-    
+
     analyzer = CephOSDAnalyzer(osd_list)
     analyzer.analyze()
 
