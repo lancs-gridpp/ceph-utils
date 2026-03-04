@@ -30,8 +30,11 @@ import os
 import sqlite3
 import subprocess
 import sys
+import io
+import functools
 from datetime import datetime
 from collections import defaultdict
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
 class CephFSMonitor:
@@ -269,11 +272,83 @@ class CephFSMonitor:
             # Update database
             self.update_database(hostname_sessions)
 
+    def generate_metrics(self, out):
+        active_mds = self.get_active_mds()
+        if not active_mds:
+            return ''
+
+        # Get current clients
+        session_list = self.get_session_list(active_mds)
+        hostname_sessions = self.parse_sessions(session_list)
+        current_hosts = set(hostname_sessions.keys())
+
+        # Get previously known hosts
+        known_hosts = self.get_known_hosts()
+
+        # Identify new and missing hosts
+        new_hosts = current_hosts - known_hosts
+        missing_hosts = known_hosts - current_hosts
+
+        out.write('HELP cephfs_sessions_expected ' +
+                  'number of expected CephFS sessions\n')
+        out.write('TYPE cephfs_sessions_expected gauge\n')
+        for hostname in hostname_sessions:
+            expected = self.get_host_mounts(hostname)
+            out.write('cephfs_sessions_expected{node="%s"} %d\n' % \
+                      (hostname, expected))
+            continue
+        out.write('HELP cephfs_sessions_found ' +
+                  'number of found CephFS sessions\n')
+        out.write('TYPE cephfs_sessions_found gauge\n')
+        for hostname, session_count in hostname_sessions.items():
+            out.write('cephfs_sessions_found{node="%s"} %d\n' % \
+                      (hostname, session_count))
+            continue
+        out.write('# EOF\n')
+
+        pass
+
 
 def main():
     monitor = CephFSMonitor()
     monitor.check_and_report()
 
 
+class CephFSHandler(BaseHTTPRequestHandler):
+    def __init__(self, *args, monitor=None, **kwargs):
+        self._mon = monitor
+        super().__init__(*args, **kwargs)
+        pass
+
+    def do_GET(self):
+        ct = 'application/openmetrics-text; version=1.0.0; charset=utf-8'
+        self.send_response(200)
+        self.send_header('Content-Type', ct)
+        self.end_headers()
+        self._out = io.TextIOWrapper(self.wfile, encoding='utf-8')
+        self._mon.generate_metrics(self._out)
+        self._out.flush()
+        pass
+
+    pass
+
 if __name__ == '__main__':
-    main()
+    from getopt import gnu_getopt
+    opts, args = gnu_getopt(sys.argv[1:], "p:h:")
+    bind_host = ""
+    bind_port = None
+    for opt, val in opts:
+        if opt == '-p':
+            bind_port = int(val)
+        elif opt == '-h':
+            bind_host = val
+            pass
+        continue
+    if bind_port is None:
+        main()
+    else:
+        monitor = CephFSMonitor()
+        webhdl = functools.partial(CephFSHandler, monitor=monitor)
+        websrv = HTTPServer((bind_host, bind_port), webhdl)
+        websrv.serve_forever()
+        pass
