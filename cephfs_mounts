@@ -331,7 +331,7 @@ class CephFSHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        ct = 'application/openmetrics-text; version=1.0.0; charset=utf-8'
+        ct = 'text/plain; charset=utf-8'
         self.send_response(200)
         self.send_header('Content-Type', ct)
         self.end_headers()
