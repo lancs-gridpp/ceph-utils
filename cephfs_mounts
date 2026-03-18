@@ -314,7 +314,6 @@ class CephFSMonitor:
             out.write('cephfs_sessions_found{node="%s"} %d\n' % \
                       (hostname, session_count))
             continue
-        out.write('# EOF\n')
 
         pass
 
