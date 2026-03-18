@@ -24,6 +24,16 @@
 #
 #---------------------------------------------------------------------------------
 #
+# Usage: cephfs_mounts
+#        Shows any missing cephfs hosts and sessions.  
+#
+# Usage: cephfs_mounts -p <port_no> -h <ip address>
+#        Creates a http server bound to <ip address>:<port_no> to serve metrics:
+#            - cephfs_sessions_expected
+#            - cephfs_sessions_found
+# 
+#---------------------------------------------------------------------------------
+#
 
 import json
 import os
