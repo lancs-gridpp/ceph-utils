@@ -299,16 +299,16 @@ class CephFSMonitor:
         new_hosts = current_hosts - known_hosts
         missing_hosts = known_hosts - current_hosts
 
-        out.write('TYPE cephfs_sessions_expected gauge\n')
-        out.write('HELP cephfs_sessions_expected ' +
+        out.write('# TYPE cephfs_sessions_expected gauge\n')
+        out.write('# HELP cephfs_sessions_expected ' +
                   'number of expected CephFS sessions\n')
         for hostname in hostname_sessions:
             expected = self.get_host_mounts(hostname)
             out.write('cephfs_sessions_expected{node="%s"} %d\n' % \
                       (hostname, expected))
             continue
-        out.write('TYPE cephfs_sessions_found gauge\n')
-        out.write('HELP cephfs_sessions_found ' +
+        out.write('# TYPE cephfs_sessions_found gauge\n')
+        out.write('# HELP cephfs_sessions_found ' +
                   'number of found CephFS sessions\n')
         for hostname, session_count in hostname_sessions.items():
             out.write('cephfs_sessions_found{node="%s"} %d\n' % \
