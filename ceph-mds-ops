@@ -1,0 +1,704 @@
+#!/usr/bin/env python3
+#---------------------------------------------------------------------------------
+# Copyright (c) 2026 Lancaster University
+# Written by: Gerard Hand
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#---------------------------------------------------------------------------------
+# Usage:
+#    python3 ceph_mds_ops.py [--sort {duration,client,type,uid}] [--min-duration SECS]
+#
+# ceph_mds_ops - Display Ceph MDS in-flight operations as a formatted table. It queries
+# each active MDS rank for ops in flight and resolves client IDs to human-readable
+# names using 'ceph tell mds.<rank> dump_ops_in_flight' and 'ceph tell mds.<rank> session ls'.
+#
+# NOTE: Compatible with python 3.6.8 (Rocky 8)
+#
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Union
+
+
+# Colour codes
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+CYAN   = "\033[36m"
+YELLOW = "\033[33m"
+RED    = "\033[31m"
+GREEN  = "\033[32m"
+DIM    = "\033[2m"
+
+
+def _supports_colour():
+    # type: () -> bool
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+USE_COLOUR = _supports_colour()
+
+
+def colourize(text, *codes):
+    # type: (str, *str) -> str
+    if not USE_COLOUR:
+        return str(text)
+    return "".join(codes) + str(text) + RESET
+
+
+def run_ceph(args, timeout=30):
+    # type: (List[str], int) -> Union[Dict, List]
+    """Run a ceph command and return parsed JSON."""
+    cmd = ["ceph", "--format", "json"] + args
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        sys.exit("ERROR: ceph command not found")
+    except subprocess.TimeoutExpired:
+        sys.exit("ERROR: Timed out running: {}".format(" ".join(cmd)))
+
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    if result.returncode != 0:
+        msg = stderr.strip() or stdout.strip()
+        sys.exit("ERROR running {}:\n  {}".format(" ".join(cmd), msg))
+
+    try:
+        return json.loads(stdout)
+    except ValueError as exc:
+        sys.exit("ERROR: Could not parse JSON from '{}':\n  {}".format(
+            " ".join(cmd), exc))
+
+
+def get_active_mds_ranks():
+    # type: () -> List[int]
+    """Return a list of active mds rank numbers"""
+    fs_dump = run_ceph(["fs", "dump"])
+    ranks = []
+
+    for fs in fs_dump.get("filesystems", []):
+        mds_map = fs.get("mdsmap", {})
+        for info in mds_map.get("info", {}).values():
+            if info.get("state") == "up:active":
+                ranks.append(info["rank"])
+
+    if not ranks:
+        print(colourize("WARNING: No active MDS ranks found.", YELLOW), file=sys.stderr)
+    return sorted(set(ranks))
+
+
+def get_ops_in_flight(rank):
+    # type: (int) -> List[Dict]
+    """Fetch ops in flight from the specified MDS rank."""
+    data = run_ceph(["tell", "mds.{}".format(rank), "dump_ops_in_flight"])
+    return data.get("ops", [])
+
+
+def get_client_name_map(rank):
+    # type: (int) -> Dict[int, str]
+    """Build a map of {client_id -> client_name}."""
+    try:
+        sessions = run_ceph(["tell", "mds.{}".format(rank), "session", "ls"])
+    except SystemExit:
+        return {}
+
+    mapping = {}
+    for session in sessions:
+        raw_id = session.get("id")
+        if raw_id is None:
+            continue
+        client_id = int(raw_id)
+
+        # Get hostname from metadata
+        metadata = session.get("client_metadata", {})
+        hostname = metadata.get("hostname", "")
+
+        # Parse the 'inst' field: "client.12345 192.168.1.10:0/..."
+        inst = session.get("inst", "")
+        inst_client = ""
+        if inst.startswith("client."):
+            inst_client = inst.split()[0]   # "client.12345"
+
+        if hostname:
+            name = "{} ({})".format(hostname, inst_client) if inst_client else hostname
+        elif inst_client:
+            name = inst_client
+        else:
+            name = "client.{}".format(client_id)
+
+        mapping[client_id] = name
+
+    return mapping
+
+
+def extract_client_id(op):
+    # type: (Dict) -> Optional[int]
+    """
+    Extract the numeric client ID from an op dict. Get from reqid.entity.num otherwise
+    get from the description.
+    """
+
+    type_data = op.get("type_data")
+    if isinstance(type_data, dict):
+        try:
+            return int(type_data["reqid"]["entity"]["num"])
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    # Fallback: description e.g. "client_request(client.23611131:11573967 ..."
+    desc = op.get("description", "")
+    if "client." in desc:
+        try:
+            after = desc.split("client.", 1)[1]   # "23611131:11573967 ..."
+            num_str = after.split(":")[0]
+            return int(num_str)
+        except (IndexError, ValueError):
+            pass
+
+    return None
+
+
+def extract_op_type(op):
+    # type: (Dict) -> str
+    """
+    Pull the op type out of the 'type_data' or 'description' fields.
+
+    NOTE: dump_ops_in_flight can return ops in several formats depending on Ceph version.
+    """
+    # type_data is a dict with key 'op_type' (e.g. 'client_request')
+    type_data = op.get("type_data")
+    if isinstance(type_data, dict):
+        op_type = type_data.get("op_type", "")
+        if op_type:
+            return op_type
+
+    if isinstance(type_data, list) and type_data:
+        return type_data[0].get("type", "unknown")
+
+    # Fallback: parse the human-readable description
+    desc = op.get("description", "")
+    if desc:
+        # e.g. "client_request(client.4294967297:1 lookup ...)"
+        if "(" in desc:
+            return desc.split("(")[0].strip()
+        return desc.split()[0]
+
+    return "unknown"
+
+
+def extract_caller_uid(op):
+    # type: (Dict) -> str
+    """Extract the caller UID from type_data or description."""
+    type_data = op.get("type_data")
+
+    # caller_uid appears in the description string:
+    # "... caller_uid=111249, caller_gid=110056{...}"
+    desc = op.get("description", "")
+    for token in desc.replace(",", " ").split():
+        if token.startswith("caller_uid="):
+            return token.split("=", 1)[1]
+
+    # Also check type_data dict / list as fallback
+    if isinstance(type_data, dict):
+        uid = type_data.get("caller_uid")
+        if uid is not None:
+            return str(uid)
+    if isinstance(type_data, list) and type_data:
+        uid = type_data[0].get("caller_uid")
+        if uid is not None:
+            return str(uid)
+
+    return "n/a"
+
+
+def extract_flag_point(op):
+    # type: (Dict) -> str
+    """Extract the current flag_point from type_data (e.g. 'failed to rdlock, waiting')."""
+    type_data = op.get("type_data")
+    if isinstance(type_data, dict):
+        fp = type_data.get("flag_point", "")
+        if fp:
+            return fp
+    return "n/a"
+
+
+def extract_request_subtype(op):
+    # type: (Dict) -> str
+    """
+    Extract the specific MDS request subtype from the description string.
+    Common values: readdir, lookup, open, create, unlink, mkdir, rmdir,
+                   rename, setattr, getattr, mknod, symlink, link, ...
+    The subtype is the first bare word after the 'client.NUM:TID' token.
+
+    "client_request(client.23611131:11573967 readdir #0x10252af0a88 ...)"
+
+    """
+    desc = op.get("description", "")
+    # Find the opening parenthasis and work inside it
+    if "(" in desc:
+        inner = desc.split("(", 1)[1]          # "client.23611131:11573967 readdir ..."
+        tokens = inner.split()
+        # First token is client.NUM:TID, second is the subtype
+        if len(tokens) >= 2:
+            return tokens[1]
+    return "n/a"
+
+
+def parse_iso(ts):
+    # type: (str) -> Optional[datetime]
+    """Parse an ISO-8601 timestamp string into an aware UTC datetime."""
+    if not ts:
+        return None
+    # Python 3.6 lacks datetime.fromisoformat(); handle manually.
+    # Acceptable forms: 2026-03-23T13:30:23.058251+0000
+    #                   2026-03-23T13:30:23+00:00
+    ts = ts.strip()
+    # Normalise +0000 -> +00:00
+    if len(ts) > 5 and ts[-5] in ("+", "-") and ":" not in ts[-5:]:
+        ts = ts[:-2] + ":" + ts[-2:]
+    try:
+        # Remove colon from timezone for strptime compatibility
+        if ts[-3] == ":":
+            ts_clean = ts[:-3] + ts[-2:]
+        else:
+            ts_clean = ts
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+            try:
+                return datetime.strptime(ts_clean, fmt)
+            except ValueError:
+                pass
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def extract_clock_skew(op):
+    # type: (Dict) -> str
+    """
+    Ceph can report stupid age values along side a sensible duration value.  This is a result
+    of a int subtraction causing underflow/wrap around
+
+    Estimate client clock skew relative to the MDS.
+
+    The description embeds the client-side timestamp of the request:
+      "client_request(client.NUM:TID <op> #<ino> <CLIENT_TS> ...)"
+
+    The 'initiated_at' field is the MDS-side timestamp of receipt.
+
+    skew = initiated_at - client_ts
+      > 0  => client clock is BEHIND the MDS  (client is slow)
+      < 0  => client clock is AHEAD  of the MDS (client is fast)
+
+    Network latency causes a small positive bias; anything beyond
+    +/-1 second is likely real skew.
+    """
+
+    initiated_at_str = op.get("initiated_at", "")
+    mds_ts = parse_iso(initiated_at_str)
+    if mds_ts is None:
+        return "n/a"
+
+    # Client timestamp is the 4th space-separated token inside the parens:
+    # "client_request(client.23611131:11573967 readdir #0x10252af0a88 2026-03-23T13:30:23.058251+0000 ...)"
+    desc = op.get("description", "")
+    client_ts = None
+    if "(" in desc:
+        inner = desc.split("(", 1)[1]
+        tokens = inner.split()
+        # Scan tokens for one that looks like an ISO timestamp
+        for token in tokens:
+            if len(token) >= 19 and "T" in token and "-" in token:
+                client_ts = parse_iso(token)
+                if client_ts is not None:
+                    break
+
+    if client_ts is None:
+        return "n/a"
+
+    skew_s = (mds_ts - client_ts).total_seconds()
+
+    if abs(skew_s) < 0.1:
+        return "~0"
+
+    sign = "+" if skew_s > 0 else "-"
+    skew_s = abs(skew_s)
+    if skew_s >= 60:
+        m, s = divmod(skew_s, 60)
+        skew_str = "{}{}m {:.1f}s".format(sign, int(m), s)
+    else:
+        skew_str = "{}{:.3f}s".format(sign, skew_s)
+
+    # Flag severe skew
+    if abs(skew_s) >= 30:
+        skew_str += " (!)"
+    return skew_str
+
+
+# Thresholds for op status classification (seconds)
+DURATION_ZOMBIE = 7 * 24 * 3600       # >7 days  => almost certainly a zombie
+DURATION_HUNG   = 3600                # >1 hour  => likely hung/stuck
+DURATION_SLOW   = 30                  # >30 s    => slow, worth noting
+SKEW_SEVERE     = 30                  # >30 s    => clock badly out of sync
+SKEW_WARN       = 1                   # >1 s     => minor clock drift
+
+
+def classify_op_status(duration_s, clock_skew_str, is_wrapped=False):
+    # type: (float, str, bool) -> str
+    """
+    Return a short human-readable status tag for the op.
+
+    Priority order (worst first):
+      WRAP     - age counter has overflowed (unsigned integer underflow)
+      ZOMBIE   - duration so large it can only be an uninitialised timer
+      HUNG     - duration > 1 hour, likely stuck/leaked
+      SLOW     - duration > 30 s
+      SKEW(!)  - severe clock skew >= 30 s
+      SKEW     - minor clock skew >= 1 s
+      OK       - nothing noteworthy
+    """
+    if is_wrapped:
+        return "WRAP"
+    if duration_s >= DURATION_ZOMBIE:
+        return "ZOMBIE"
+    if duration_s >= DURATION_HUNG:
+        return "HUNG"
+    if duration_s >= DURATION_SLOW:
+        return "SLOW"
+    # Parse skew magnitude from the formatted string (strip sign and " (!)")
+    if clock_skew_str not in ("~0", "n/a"):
+        skew_clean = clock_skew_str.replace("(!)", "").replace("+", "").replace("-", "").strip()
+        skew_s = 0.0
+        if "m" in skew_clean:
+            parts = skew_clean.split("m")
+            try:
+                skew_s = int(parts[0]) * 60 + float(parts[1].replace("s", "").strip())
+            except (ValueError, IndexError):
+                pass
+        else:
+            try:
+                skew_s = float(skew_clean.replace("s", "").strip())
+            except ValueError:
+                pass
+        if skew_s >= SKEW_SEVERE:
+            return "SKEW(!)"
+        if skew_s >= SKEW_WARN:
+            return "SKEW"
+    return "OK"
+
+
+# Colour to use for each status tag
+STATUS_COLOUR = {
+    "WRAP":    CYAN,
+    "ZOMBIE":  RED,
+    "HUNG":    RED,
+    "SLOW":    YELLOW,
+    "SKEW(!)": RED,
+    "SKEW":    YELLOW,
+    "OK":      GREEN,
+}
+
+
+# 2^32 microseconds in seconds - the unsigned 32-bit wraparound boundary
+_U32_WRAP_SECS = 4294967296.0 / 1e6   # ~4294.97 seconds (~71.6 minutes)
+
+# Anything reported over _U32_WRAP_SECS seconds is almost certainly wrapped
+_WRAP_THRESHOLD_SECS = 3600.0          # 1 hour
+
+
+def parse_duration(op):
+    # type: (Dict) -> float
+    """ Return op age/duration in seconds as a float. """
+    for key in ("age", "duration"):
+        val = op.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def real_duration(op):
+    # type: (Dict) -> Optional[float]
+    """
+    Calc the true elapsed seconds from initiated_at to now.
+    Returns None if initiated_at is missing or unparseable.
+    """
+    mds_ts = parse_iso(op.get("initiated_at", ""))
+    if mds_ts is None:
+        return None
+    now = datetime.now(timezone.utc)
+    elapsed = (now - mds_ts).total_seconds()
+    return max(elapsed, 0.0)
+
+
+def duration_info(op):
+    # type: (Dict) -> tuple
+    """
+    Return (display_seconds, display_string, is_wrapped).
+
+    If the reported age looks like a wraparound (reported >> real elapsed),
+    replace it with the initiated_at-derived value and flag it.
+    """
+    reported = parse_duration(op)
+    real     = real_duration(op)
+
+    if real is not None and reported > _WRAP_THRESHOLD_SECS:
+        # How many wraps would produce the reported value?
+        # If real elapsed is small but reported is huge, it has wrapped.
+        expected_wraps = round(reported / _U32_WRAP_SECS)
+        if expected_wraps >= 1:
+            # Real duration should be close to reported mod wrap_boundary
+            remainder = reported - (expected_wraps * _U32_WRAP_SECS)
+            if abs(real - remainder) < 60 or real < _WRAP_THRESHOLD_SECS:
+                return (real, format_duration(real) + " [WRAP]", True)
+
+    return (reported, format_duration(reported), False)
+
+
+def format_duration(seconds):
+    # type: (float) -> str
+    if seconds >= 60:
+        m, s = divmod(seconds, 60)
+        return "{}m {:.1f}s".format(int(m), s)
+    return "{:.3f}s".format(seconds)
+
+
+# Output table column names and min widths.
+COLUMNS = [
+    ("Status",     7),
+    ("MDS Rank",   8),
+    ("Client",    32),
+    ("UID",        6),
+    ("Op Type",   16),
+    ("Request",   10),
+    ("Flag Point", 36),
+    ("Skew",      10),
+    ("Duration",  12),
+]
+
+
+def table_col_widths(rows):
+    # type: (List[Dict]) -> Dict[str, int]
+    """ Return the column widths for the output table.  Min widths defined in COLUMS. """
+    widths = {name: w for name, w in COLUMNS}
+    for row in rows:
+        widths["Client"]     = max(widths["Client"],     len(row["client"]))
+        widths["Op Type"]    = max(widths["Op Type"],    len(row["op_type"]))
+        widths["Request"]    = max(widths["Request"],    len(row["request"]))
+        widths["Flag Point"] = max(widths["Flag Point"], len(row["flag_point"]))
+        widths["Skew"]       = max(widths["Skew"],       len(row["clock_skew"]))
+        widths["Duration"]   = max(widths["Duration"],   len(row["duration_str"]))
+        widths["Status"]     = max(widths["Status"],     len(row["status"]))
+    return widths
+
+
+def render_table(rows):
+    # type: (List[Dict]) -> None
+    if not rows:
+        print(colourize("  No ops in flight.", GREEN))
+        return
+
+    widths = table_col_widths(rows)
+
+    def cell(text, col):
+        return str(text).ljust(widths[col])
+
+    sep_parts = ["-" * widths[name] for name, _ in COLUMNS]
+    separator = "-+-".join(sep_parts)
+
+    header_parts = [colourize(cell(name, name), BOLD, CYAN) for name, _ in COLUMNS]
+    header = " | ".join(header_parts)
+
+    print(header)
+    print(colourize(separator, DIM))
+
+    for row in rows:
+        duration = row["duration_s"]
+        if row.get("duration_wrapped"):
+            dur_colour = CYAN
+        elif duration >= 30:
+            dur_colour = RED
+        elif duration >= 5:
+            dur_colour = YELLOW
+        else:
+            dur_colour = RESET
+
+        skew        = row["clock_skew"]
+        skew_colour  = RED if "(!)" in skew else YELLOW if skew not in ("~0", "n/a") else RESET
+        status       = row["status"]
+        status_col   = STATUS_COLOUR.get(status, RESET)
+
+        parts = [
+            colourize(cell(status,              "Status"),     status_col, BOLD),
+            colourize(cell(row["rank"],         "MDS Rank"),   BOLD),
+            colourize(cell(row["client"],       "Client"),     CYAN),
+            cell(row["uid"],            "UID"),
+            cell(row["op_type"],        "Op Type"),
+            colourize(cell(row["request"],      "Request"),    CYAN),
+            colourize(cell(row["flag_point"],   "Flag Point"), DIM),
+            colourize(cell(skew,               "Skew"),        skew_colour),
+            colourize(cell(row["duration_str"], "Duration"),   dur_colour),
+        ]
+        print(" | ".join(parts))
+
+    print(colourize(separator, DIM))
+    total   = len(rows)
+    counts  = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+
+    # Human-readable label for each status tag shown in the summary line
+    SUMMARY_LABEL = {
+        "WRAP":    "WRAP (age counter overflowed, real duration shown)",
+        "ZOMBIE":  "ZOMBIE (timer never initialised, likely stale)",
+        "HUNG":    "HUNG (>1 hour, possibly stuck)",
+        "SLOW":    "SLOW (>30s)",
+        "SKEW(!)": "SKEW! (clock skew >=30s)",
+        "SKEW":    "SKEW (clock skew >=1s)",
+        "OK":      "OK",
+    }
+
+    print("\n  Total ops: {}".format(colourize(total, BOLD)), end="")
+    for tag in ("WRAP", "ZOMBIE", "HUNG", "SLOW", "SKEW(!)", "SKEW", "OK"):
+        n = counts.get(tag, 0)
+        if n:
+            col   = STATUS_COLOUR.get(tag, RESET)
+            label = SUMMARY_LABEL.get(tag, tag)
+            print("  |  {}".format(colourize("{} {}".format(n, label), col, BOLD)), end="")
+    print()
+
+
+def build_rows(rank, ops, client_map):
+    # type: (int, List[Dict], Dict[int, str]) -> List[Dict]
+    rows = []
+    for op in ops:
+        client_id = extract_client_id(op)
+        if client_id is not None:
+            client_name = client_map.get(
+                client_id,
+                "client.{}".format(client_id)   # fallback if not in session list
+            )
+        else:
+            client_name = "unknown"
+
+        dur_s, dur_str, dur_wrapped = duration_info(op)
+        skew   = extract_clock_skew(op)
+        status = classify_op_status(dur_s, skew, is_wrapped=dur_wrapped)
+        rows.append({
+            "rank":             str(rank),
+            "client":           client_name,
+            "uid":              extract_caller_uid(op),
+            "op_type":          extract_op_type(op),
+            "request":          extract_request_subtype(op),
+            "flag_point":       extract_flag_point(op),
+            "clock_skew":       skew,
+            "status":           status,
+            "duration_s":       dur_s,
+            "duration_str":     dur_str,
+            "duration_wrapped": dur_wrapped,
+        })
+    return rows
+
+
+SORT_KEYS = {
+    "duration": lambda r: r["duration_s"],
+    "client":   lambda r: r["client"].lower(),
+    "type":     lambda r: r["op_type"].lower(),
+    "uid":      lambda r: r["uid"],
+}
+
+
+def main():
+    # type: () -> None
+    parser = argparse.ArgumentParser(
+        description="Show Ceph MDS in-flight ops as a formatted table.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--sort",
+        choices=list(SORT_KEYS),
+        default="duration",
+        help="Column to sort by (default: duration, descending)",
+    )
+    parser.add_argument(
+        "--min-duration",
+        type=float,
+        default=0.0,
+        metavar="SECS",
+        help="Only show ops older than this many seconds (default: 0 = all)",
+    )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Query a specific MDS rank only (default: all active ranks)",
+    )
+    args = parser.parse_args()
+
+    ranks = [args.rank] if args.rank is not None else get_active_mds_ranks()
+
+    if not ranks:
+        print("No active MDS ranks to query.")
+        sys.exit(0)
+
+    all_rows = []
+
+    for rank in ranks:
+        print(colourize("Querying MDS rank {} ...".format(rank), DIM), file=sys.stderr)
+
+        client_map = get_client_name_map(rank)
+        ops        = get_ops_in_flight(rank)
+
+        if not ops:
+            print(colourize("  mds.{}: no ops in flight.".format(rank), DIM), file=sys.stderr)
+            continue
+
+        rows = build_rows(rank, ops, client_map)
+        all_rows.extend(rows)
+
+    # Filter
+    if args.min_duration > 0:
+        all_rows = [r for r in all_rows if r["duration_s"] >= args.min_duration]
+
+    # Sort (descending for duration, ascending for everything else)
+    reverse = args.sort == "duration"
+    all_rows.sort(key=SORT_KEYS[args.sort], reverse=reverse)
+
+    print()
+    render_table(all_rows)
+    print()
+
+# ****************************************************************************************************
+
+if __name__ == "__main__":
+    main()
+
