@@ -22,6 +22,7 @@ Assorted BASH and Python command line scripts to either cut down the amount of t
 | restartosd | Restart the specified osd id using ceph orhcestration.  Checks are made to make sure it is safe to restart the osd and the script verifies the osd has restarted. |
 | scrubbing  | Set/Unset the OSD scrubbing flags and optionally mute the health warning OSDMAP_FLAGS |
 | scrubinfo | Show the PG scrubbing information |
+| scrubintervals | Show the current scrubbing configuration settings |
 | scrubsched | Give details of scrubbing intervals |
 | startceph | Put the cluster back in a working state. Usage: `startceph` |
 | startmaint | Puts `<hostname>` into maintenance mode. Usage: `startmaint <hostname>` |

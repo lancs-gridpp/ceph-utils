@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+
+#---------------------------------------------------------------------------------
+# Copyright (c) 2025 Lancaster University
+# Written by: Gerard Hand
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#---------------------------------------------------------------------------------
+#
+# Usage: scrubintervals
+#
+# Read Ceph scrubbing interval values from the cluster config and display each one
+# as a human-readable duration instead of a raw second count.
+#
+
+import subprocess
+import json
+import sys
+from typing import Dict, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+
+# Scrub-related config keys to show
+SCRUB_KEYS = {
+    "osd_scrub_min_interval",
+    "osd_scrub_max_interval",
+    "osd_deep_scrub_interval",
+    "osd_scrub_sleep",
+    "osd_scrub_chunk_min",
+    "osd_scrub_chunk_max",
+    "osd_scrub_interval_randomize_ratio",
+    "osd_scrub_begin_hour",
+    "osd_scrub_end_hour",
+    "osd_scrub_begin_week_day",
+    "osd_scrub_end_week_day",
+}
+
+# Keys whose values are NOT durations in seconds
+NON_DURATION_KEYS = {
+    "osd_scrub_chunk_min",
+    "osd_scrub_chunk_max",
+    "osd_scrub_interval_randomize_ratio",
+    "osd_scrub_begin_hour",
+    "osd_scrub_end_hour",
+    "osd_scrub_begin_week_day",
+    "osd_scrub_end_week_day",
+}
+
+WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday",
+            "Thursday", "Friday", "Saturday"]
+
+
+#---------------------------------------------------------------------------
+def seconds_to_human(seconds):
+    # type: (float) -> str
+    """Convert a number of seconds into days, hours, minutes and seconds."""
+    if seconds == 0:
+        return "0 seconds"
+
+    thresholds = [
+        ("day",    86_400),
+        ("hour",   3_600),
+        ("minute", 60),
+        ("second", 1),
+    ]
+    parts = []
+    remainder = int(seconds)
+
+    for unit, divisor in thresholds:
+        count, remainder = divmod(remainder, divisor)
+        if count:
+            parts.append("{} {}{}".format(count, unit, "s" if count != 1 else ""))
+
+    return ", ".join(parts) if parts else "0 seconds"
+
+
+#---------------------------------------------------------------------------
+def format_value(key, value):
+    # type: (str, str) -> str
+    """Return a display string for the given key/value pair."""
+    if key in NON_DURATION_KEYS:
+        if key in ("osd_scrub_begin_week_day", "osd_scrub_end_week_day"):
+            # Return the day of the week.
+            try:
+                idx = int(float(value))
+                return "{}  ({})".format(WEEKDAYS[idx % 7], value)
+            except (ValueError, IndexError):
+                pass
+
+        if key in ("osd_scrub_begin_hour", "osd_scrub_end_hour"):
+            # Return time of day.
+            try:
+                h = int(float(value))
+                suffix = "AM" if h < 12 else "PM"
+                display = h if h <= 12 else h - 12
+                if display == 0:
+                    display = 12
+                return "{}:00 {}  ({})".format(display, suffix, value)
+            except ValueError:
+                pass
+
+        # ratio or chunk count – show as-is
+        return value
+
+    # Duration key. Return days, hours, minutes, seconds.
+    try:
+        secs = float(value)
+        return "{}  ({})".format(seconds_to_human(secs), value)
+    except ValueError:
+        return "invalid"
+
+
+#---------------------------------------------------------------------------
+def run_ceph_cmd(*args):
+    # type: (*str) -> Tuple[int, str, str]
+    """Run a ceph command and return (returncode, stdout, stderr)."""
+    cmd = ["ceph"] + list(args) + ["--format", "json"]
+    try:
+        # Python 3.6.8 compatible.
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True, timeout=15)
+        return result.returncode, result.stdout, result.stderr
+
+    except FileNotFoundError:
+        return 127, "", "ceph command not found — is the Ceph client installed?"
+
+    except subprocess.TimeoutExpired:
+        return 1, "", "ceph command timed out"
+
+
+#---------------------------------------------------------------------------
+def get_default_value(who, key):
+    # type: (str, str) -> Optional[str]
+    """Fetch a single config value via `ceph config get <who> <key>`."""
+    rc, stdout, stderr = run_ceph_cmd("config", "get", who, key)
+    if rc != 0:
+        return "Not set"
+    try:
+        data = json.loads(stdout.strip())
+        # Response is either a plain string value or {"value": "..."}
+        if isinstance(data, dict):
+            return str(data.get("value", ""))
+        return str(data).strip('"')
+    except (json.JSONDecodeError, TypeError):
+        return stdout.strip().strip('"') or None
+
+
+#---------------------------------------------------------------------------
+def get_config_dump():
+    # type: () -> Dict[str, Dict[str, str]]
+    """
+    Return all explicitly-set scrubbing related config values from
+    `ceph config dump`
+
+    Returns:
+    a dict of:
+        {
+            key: {
+                "section": section,
+                "value": value
+            }
+        }
+    """
+    rc, stdout, stderr = run_ceph_cmd("config", "dump")
+    if rc != 0:
+        return {}
+
+    try:
+        entries = json.loads(stdout)
+    except json.JSONDecodeError:
+        return {}
+
+    result = {}
+
+    for entry in entries:
+        name = entry.get("name", "")
+
+        if name in SCRUB_KEYS:
+            item = {
+                "section": str(entry.get("section", "")),
+                "value": str(entry.get("value", ""))
+            }
+            result.setdefault(name, []).append(item)
+
+    return result
+
+
+#---------------------------------------------------------------------------
+# Main
+#---------------------------------------------------------------------------
+
+def main():
+    # type: () -> None
+    print("\nCeph Scrubbing Interval Configuration")
+    print("=" * 37)
+
+    # 1. Try to get explicitly-set values from the config dump
+    dump_values = get_config_dump()
+    # print(dump_values)
+
+    # 2. For any missing key, fall back to querying the compiled-in default
+    #    from the 'osd' daemon type (covers the most common use-case)
+    resolved = {}   # type: Dict[str, Tuple[str, str]]  # key -> (value, source)
+
+    for key in SCRUB_KEYS:
+        if key in dump_values:
+            resolved[key] = dump_values[key]          # already a list
+        else:
+            val = get_default_value("osd", key)
+            resolved[key] = [{"section": "default", "value": val}]
+    # print(resolved)
+    if not resolved:
+        print("\n  Could not retrieve any config values.")
+        print("  Make sure 'ceph' is installed and you have cluster access.\n")
+        sys.exit(1)
+
+    # 3. Display results grouped by type
+    groups = [
+        ("Light scrub timing",
+         ["osd_scrub_min_interval", "osd_scrub_max_interval",
+          "osd_scrub_interval_randomize_ratio"]),
+        ("Deep scrub timing",
+         ["osd_deep_scrub_interval"]),
+        ("Scrub window (time-of-day & weekday)",
+         ["osd_scrub_begin_hour", "osd_scrub_end_hour",
+          "osd_scrub_begin_week_day", "osd_scrub_end_week_day"]),
+        ("Throttling",
+         ["osd_scrub_sleep",
+          "osd_scrub_chunk_min", "osd_scrub_chunk_max"]),
+    ]
+
+    for group_title, keys in groups:
+        print("\n" + group_title + ":\n")
+        print(f"    {'Key':<35} {'Section':<15} Value")
+        print(f"    {'---':<35} {'-------':<15} -----")
+        for key in keys:
+            if key not in resolved:
+                continue
+            for entry in resolved[key]:
+                section = entry['section']
+                value   = entry['value']
+                display = format_value(key, value)
+                print(f"    {key:<35} {section:<15} {display}")
+        print("")
+
+#---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    main()
