@@ -141,6 +141,10 @@ class CephFSMonitor:
 
                     seen_ids.add(sid)
 
+                    # kernel version might not be defined so add it in if it's missing
+                    if 'kernel_version' not in session['client_metadata']:
+                        session['client_metadata']['kernel_version']="No defined"
+
                     sessions.append((
                         session['id'],
                         session['entity']['addr']['addr'],
