@@ -1,8 +1,8 @@
 #!/usr/bin/python3
 
 #---------------------------------------------------------------------------------
-# Copyright (c) 2026 Lancaster University
-# Author: Gerard Hand
+# Copyright (c) 2025 Lancaster University
+# Written by: Gerard Hand
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 #
 #---------------------------------------------------------------------------------
 #
-# Usage: activescrubs [-s COLUMN] [-r] [-t TYPE] [-i SECONDS]
+# Usage: activescrubs [-s COLUMN] [-r] [-t TYPE] [-i SECONDS] [-V]
 #
 # Show the pgs that are active scrubbing with automatic period updates.
 #
@@ -34,6 +34,7 @@
 #   -r, --reverse       Sort in descending order.
 #   -t, --type TYPE     Scrub types to show: shallow, deep or both.
 #   -i, --interval SEC  Seconds between refreshes.
+#   -V, --version       Show the script version and exit.
 #
 # Interactive keys:
 #   q        Quit.
@@ -43,9 +44,15 @@
 #   r        Toggle ascending / descending sort.
 #   t        Cycle the scrub type filter (both -> shallow -> deep).
 #   + / -    Increase / decrease the refresh interval by INTERVAL_STEP seconds.
+#   j / k    Scroll the pg list down / up by one line.
+#   d / u    Scroll the pg list down / up by one page.
+#   g / G    Jump to the top / bottom of the pg list.
 #
 # Things to do:
-# * include versioning.
+# * If an active scrub doesn't update the number of objects scrubbed on a refresh
+#   it continues to be shown as active for an 'idle' period.  This is currently
+#   based on the number of refreshes done since it stopped updating the number of
+#   objects scrubbed.  This might be better being a timebased idle period.
 
 
 import argparse
@@ -68,6 +75,9 @@ STAT_NONE   = ' '
 #STAT_RIGHT = '\u2192'      # Unicode arrow right
 
 IDLE_TIMEOUT = 60  # Number of seconds a pg can be idle before it is no longer shown.
+
+# Script version, shown by -V/--version.
+VERSION = "1.1"
 
 # Refresh interval settings (seconds).
 DEFAULT_INTERVAL = 30.0    # Interval used when --interval is not given.
@@ -413,7 +423,23 @@ def filter_and_sort_pgs(active_pgs, settings):
 
     return sorted(pgs, key=sort_column_key(settings['sort']), reverse=settings['reverse'])
 
-def print_active_pgs(count_shallow, count_deep, all_active_pgs, display_pgs,
+def compute_last_row(tty_height):
+    """
+    The last (relative) content row available for pg data - data starts at
+    relative row 6 - leaving room for the footer and the reserved top line.
+    """
+    return tty_height - FOOTER_HEIGHT - 3
+
+def displayable_pgs(display_pgs):
+    """
+    Filter down to just the pgs that are actually shown - ones with objects
+    to scrub and some progress to report.  Scrolling works over this list, so
+    the visible window always contains exactly the rows that will be printed.
+    """
+    return [item for item in display_pgs
+            if item[1]['total_objects'] > 0 and item[1]['objects_scrubbed'] > 0]
+
+def print_active_pgs(count_shallow, count_deep, all_active_pgs, window,
                      tty_height=24, tty_width=80, count_stats=True):
 
     """
@@ -425,7 +451,8 @@ def print_active_pgs(count_shallow, count_deep, all_active_pgs, display_pgs,
                                Active/Scrubbing/Obj/s header, exactly as in the
                                original script, so the type filter and sort order
                                don't change those figures.
-        display_pgs (list): The (filtered and sorted) pgs to list in the table.
+        window (list): The slice of (filtered, sorted, displayable) pgs to show,
+                       already narrowed down to the current scroll position.
         tty_height (int): Height of the terminal.
         tty_width (int): Width of the terminal.
         count_stats (bool): Include this display in the average obj/s calculation.
@@ -454,19 +481,15 @@ def print_active_pgs(count_shallow, count_deep, all_active_pgs, display_pgs,
     print(f"{'PGID':<7}  {'Type':^10}  {'Objects':^10}  {'Scrubbed':^10} {'Obj/s':<6} {'Percent':<8}  ")
     row = 6
 
-    # The last screen line available for pg data, leaving room for the footer
-    # and for row 1, which is reserved for the fetch progress message.
-    last_row = tty_height - FOOTER_HEIGHT - 3
+    last_row = compute_last_row(tty_height)
 
-    for pgid,pg in display_pgs:
+    for pgid,pg in window:
         if row > last_row:
-            # Leave space for the footer
+            # The window should already fit, but don't overrun the footer if not.
             break
-        # Ignore pgs with no objects to scrub or that haven't scrubbed any objects.
-        if pg['total_objects']>0 and pg['objects_scrubbed']>0:
-            percent = f"{(pg['objects_scrubbed'] / pg['total_objects'] * 100):.2f}%"
-            print(f"{pgid:<7}  {pg['scrub_type']:^10}  {pg['total_objects']:<10}  {pg['objects_scrubbed']:<10} {pg['objects_per_sec']:<6.3f}  {percent:<8} {pg['state']}")
-            row += 1
+        percent = f"{(pg['objects_scrubbed'] / pg['total_objects'] * 100):.2f}%"
+        print(f"{pgid:<7}  {pg['scrub_type']:^10}  {pg['total_objects']:<10}  {pg['objects_scrubbed']:<10} {pg['objects_per_sec']:<6.3f}  {percent:<8} {pg['state']}")
+        row += 1
 
     if row <= last_row:
         # Fill the remaining lines with empty rows
@@ -474,20 +497,30 @@ def print_active_pgs(count_shallow, count_deep, all_active_pgs, display_pgs,
             print(" " * tty_width)
             row += 1
 
-def print_footer(settings, tty_width):
+def print_footer(settings, tty_width, scroll=0, total=0, visible=0):
     """
     Print the settings line and the key help line.
 
     Args:
         settings (dict): Current display settings.
         tty_width (int): Width of the terminal.
+        scroll (int): Index of the first pg currently shown.
+        total (int): Total number of (displayable) pgs, across all scroll positions.
+        visible (int): Number of pg rows visible at once.
     """
     order = 'desc' if settings['reverse'] else 'asc'
+    if total > visible:
+        first = scroll + 1
+        last = min(scroll + visible, total)
+        pg_range = f"  PGs: {first}-{last}/{total}"
+    else:
+        pg_range = f"  PGs: {total}"
     status = (f"Sort: {sort_column_display(settings['sort'])} ({order})   "
               f"Show: {settings['filter']}   "
-              f"Interval: {settings['interval']:g}s")
+              f"Interval: {settings['interval']:g}s"
+              f"{pg_range}")
     keys = (f"q=quit  SPACE=refresh  s+({SORT_KEY_HELP})=sort  "
-            f"r=reverse  t=scrub type  +/-=interval")
+            f"r=reverse  t=scrub type  +/-=interval  j/k/d/u/g/G=scroll")
 
     print("")
     print(status[:tty_width].ljust(tty_width))
@@ -549,6 +582,26 @@ def handle_key(key, settings):
     if key in ('-', '_'):
         return 'redraw' if change_interval(settings, -INTERVAL_STEP) else ''
 
+    if key == 'j':
+        settings['scroll'] += 1
+        return 'redraw'
+    if key == 'k':
+        settings['scroll'] = max(0, settings['scroll'] - 1)
+        return 'redraw'
+    if key == 'd':
+        settings['scroll'] += max(1, settings.get('visible_rows', 1))
+        return 'redraw'
+    if key == 'u':
+        settings['scroll'] = max(0, settings['scroll'] - max(1, settings.get('visible_rows', 1)))
+        return 'redraw'
+    if key == 'g':
+        settings['scroll'] = 0
+        return 'redraw'
+    if key == 'G':
+        # Jump to the last page - clamped to the real maximum on the next draw.
+        settings['scroll'] = sys.maxsize
+        return 'redraw'
+
     return ''
 
 def wait_for_interval(nbc, settings):
@@ -594,6 +647,8 @@ def parse_args():
                         metavar='SECONDS',
                         help="Seconds between refreshes, {:g}-{:g} (default: {:g}).".format(
                             MIN_INTERVAL, MAX_INTERVAL, DEFAULT_INTERVAL))
+    parser.add_argument('-V', '--version', action='version',
+                        version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
 
     if not MIN_INTERVAL <= args.interval <= MAX_INTERVAL:
@@ -618,7 +673,9 @@ def main():
                 'reverse': args.reverse,
                 'filter': args.type,
                 'interval': args.interval,
-                'awaiting_sort': False}
+                'awaiting_sort': False,
+                'scroll': 0,
+                'visible_rows': 0}
 
     # Get the terminal size to adjust output accordingly.
     tty_size = shutil.get_terminal_size()
@@ -665,16 +722,28 @@ def main():
                 # was a settings-only redraw.
                 goto_content_start()
 
-                # Apply the scrub type filter and the sort order.
+                # Apply the scrub type filter and the sort order, then narrow
+                # down to the pgs that are actually shown.
                 display_pgs = filter_and_sort_pgs(active_pgs, settings)
+                rows = displayable_pgs(display_pgs)
+
+                # Work out how many rows fit, and clamp the scroll position to
+                # the current data and terminal size.
+                last_row = compute_last_row(tty_size.lines)
+                visible_rows = max(0, last_row - 5)
+                max_scroll = max(0, len(rows) - visible_rows)
+                settings['scroll'] = max(0, min(settings['scroll'], max_scroll))
+                settings['visible_rows'] = visible_rows
+                window = rows[settings['scroll']:settings['scroll'] + visible_rows]
 
                 # Display the currently scrubbing pgs.  all_active_pgs keeps the
                 # header stats unaffected by the filter/sort, per the original script.
-                print_active_pgs(count_shallow, count_deep, active_pgs, display_pgs,
+                print_active_pgs(count_shallow, count_deep, active_pgs, window,
                                  tty_size.lines, tty_size.columns,
                                  count_stats=need_fetch)
 
-                print_footer(settings, tty_size.columns)
+                print_footer(settings, tty_size.columns,
+                            scroll=settings['scroll'], total=len(rows), visible=visible_rows)
 
                 # Wait for refresh interval.  A settings change redraws the data
                 # we already have rather than re-reading it from ceph.
