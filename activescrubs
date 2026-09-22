@@ -1,8 +1,8 @@
 #!/usr/bin/python3
 
 #---------------------------------------------------------------------------------
-# Copyright (c) 2025 Lancaster University
-# Written by: Gerard Hand
+# Copyright (c) 2026 Lancaster University
+# Author: Gerard Hand
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -24,18 +24,31 @@
 #
 #---------------------------------------------------------------------------------
 #
-# Usage: activescrubs
+# Usage: activescrubs [-s COLUMN] [-r] [-t TYPE] [-i SECONDS]
 #
 # Show the pgs that are active scrubbing with automatic period updates.
 #
+# Command line options:
+#   -s, --sort COLUMN   Column to sort the display by.  One of:
+#                       pgid, type, objects, scrubbed, rate, percent.
+#   -r, --reverse       Sort in descending order.
+#   -t, --type TYPE     Scrub types to show: shallow, deep or both.
+#   -i, --interval SEC  Seconds between refreshes.
+#
+# Interactive keys:
+#   q        Quit.
+#   <space>  Refresh now.
+#   s <key>  Sort by a column: p=PGID, t=Type, o=Objects, c=Scrubbed count,
+#            r=Obj/s rate, %=Percent.
+#   r        Toggle ascending / descending sort.
+#   t        Cycle the scrub type filter (both -> shallow -> deep).
+#   + / -    Increase / decrease the refresh interval by INTERVAL_STEP seconds.
+#
 # Things to do:
-# * If an active scrub doesn't update the number of objects scrubbed on a refresh
-#   it continues to be shown as active for an 'idle' period.  This is currently
-#   based on the number of refreshes done since it stopped updating the number of
-#   objects scrubbed.  This might be better being a timebased idle period.
 # * include versioning.
 
 
+import argparse
 from datetime import datetime, timedelta
 import json
 import os
@@ -55,6 +68,19 @@ STAT_NONE   = ' '
 #STAT_RIGHT = '\u2192'      # Unicode arrow right
 
 IDLE_TIMEOUT = 60  # Number of seconds a pg can be idle before it is no longer shown.
+
+# Refresh interval settings (seconds).
+DEFAULT_INTERVAL = 30.0    # Interval used when --interval is not given.
+INTERVAL_STEP    = 30.0    # Amount +/- changes the interval by.
+MIN_INTERVAL     = 1.0     # Shortest allowed interval.
+MAX_INTERVAL     = 600.0   # Longest allowed interval.
+POLL_STEP        = 0.2     # How often key presses are checked while waiting.
+
+# Number of lines used by the footer (blank line, settings line, key help line).
+FOOTER_HEIGHT = 3
+
+# Scrub type filters, in the order the 't' key cycles through them.
+SCRUB_FILTERS = ['both', 'shallow', 'deep']
 
 # Global variables to calculate average objects per second.
 glob_disp_count = 0
@@ -80,6 +106,64 @@ class NonBlockingConsole(object):
         if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
             return sys.stdin.read(1)
         return False
+
+def pgid_sort_key(pgid):
+    """
+    Return a sort key for a pgid so that pools sort numerically and the pg
+    number sorts by its hexadecimal value rather than as text.
+    Args:
+        pgid (str): The pg id, e.g. '3.1f' or '3.1fs0'.
+    Returns:
+        tuple: Sortable key for the pgid.
+    """
+    try:
+        pool, rest = pgid.split('.', 1)
+        # Strip any shard suffix (e.g. '1fs0') before converting from hex.
+        pg_num = rest.split('s')[0]
+        return (int(pool), int(pg_num, 16), rest)
+    except (ValueError, IndexError):
+        # Anything unexpected sorts last, alphabetically.
+        return (sys.maxsize, 0, pgid)
+
+def percent_scrubbed(pg):
+    """Return the percentage of objects scrubbed, or 0 if it can't be worked out."""
+    if pg['total_objects'] > 0:
+        return pg['objects_scrubbed'] / pg['total_objects']
+    return 0.0
+
+# Sort columns.  Each entry maps the option name to the display name, the key
+# letter pressed after 's' to select it, and the key function used to sort a
+# (pgid, pg) tuple.
+SORT_COLUMNS = [
+    ('pgid',     'PGID',     'p', lambda item: pgid_sort_key(item[0])),
+    ('type',     'Type',     't', lambda item: (item[1]['scrub_type'], pgid_sort_key(item[0]))),
+    ('objects',  'Objects',  'o', lambda item: (item[1]['total_objects'], pgid_sort_key(item[0]))),
+    ('scrubbed', 'Scrubbed', 'c', lambda item: (item[1]['objects_scrubbed'], pgid_sort_key(item[0]))),
+    ('rate',     'Obj/s',    'r', lambda item: (item[1]['objects_per_sec'], pgid_sort_key(item[0]))),
+    ('percent',  'Percent',  '%', lambda item: (percent_scrubbed(item[1]), pgid_sort_key(item[0]))),
+]
+
+SORT_NAMES = [name for name, _, _, _ in SORT_COLUMNS]
+
+# Maps the key pressed after 's' to the column name it selects.
+SORT_KEY_MAP = {key: name for name, _, key, _ in SORT_COLUMNS}
+
+# Human-readable form of the mapping, used in the footer key help.
+SORT_KEY_HELP = '/'.join(f"{key}={title}" for _, title, key, _ in SORT_COLUMNS)
+
+def sort_column_display(column):
+    """Return the display name for a sort column."""
+    for name, title, _, _ in SORT_COLUMNS:
+        if name == column:
+            return title
+    return column
+
+def sort_column_key(column):
+    """Return the sort key function for a sort column."""
+    for name, _, _, key_func in SORT_COLUMNS:
+        if name == column:
+            return key_func
+    return SORT_COLUMNS[0][3]
 
 def get_pg_status():
     """
@@ -227,23 +311,43 @@ def show_cursor():
 
 def reset_cursor():
     """
-    Move the cursor to the top left corner of the terminal.
+    Move the cursor to the top left corner of the terminal (row 1, column 1).
+    Row 1 is reserved for the "Fetching..." progress message managed by
+    fetch_pg_data(); the main content always starts at row 2 - see
+    goto_content_start().
     """
-    # Move the cursor to the top left corner
     sys.stdout.write("\033[H")
+    sys.stdout.flush()
+
+def goto_content_start():
+    """
+    Move the cursor to the start of the main content area (row 2, column 1),
+    leaving row 1 free to show (or blank) the fetch progress message without
+    it ever being overwritten by the Shallow/Deep/Active counts.
+    """
+    sys.stdout.write("\033[2;1H")
     sys.stdout.flush()
 
 def fetch_pg_data():
     """
     Fetch the scrubbing PGs from ceph and the number of shallow and deep scrubs.
 
+    Shows a progress message on the reserved top line of the screen (row 1)
+    while the ceph command runs - which can take a moment - then blanks that
+    line again once done.  The main content (Shallow/Deep/Active counts
+    onwards) always starts on row 2, so it is never overwritten by, or
+    overwrites, this message.
+
     Returns:
         tuple: (scrubbing_pgs (dict), count_shallow (int), count_deep (int))
     """
-    print("Fetching Ceph PG information...")
+    reset_cursor()
+    sys.stdout.write("Fetching Ceph PG information...")
+    sys.stdout.flush()
     scrubbing_pgs, count_shallow, count_deep = get_scrubbing_pg_info()
     reset_cursor()
-    print(" " * 40 )
+    sys.stdout.write(" " * 40)
+    sys.stdout.flush()
     return scrubbing_pgs, count_shallow, count_deep
 
 def get_active_pgs(scrubbing_pgs, last_pg_run, idle_pgs):
@@ -289,41 +393,73 @@ def get_active_pgs(scrubbing_pgs, last_pg_run, idle_pgs):
 
     return sorted(active.items(), key=lambda pg: pg[0])  # Sort by pgid
 
-def print_active_pgs(count_shallow, count_deep, active_pgs, tty_height=24, tty_width=80):
+def filter_and_sort_pgs(active_pgs, settings):
+    """
+    Apply the scrub type filter and the requested sort order to the active pgs.
+
+    Args:
+        active_pgs (list): List of (pgid, pg) tuples.
+        settings (dict): Display settings ('filter', 'sort', 'reverse').
+    Returns:
+        list: Filtered and sorted list of (pgid, pg) tuples.
+    """
+    scrub_filter = settings['filter']
+    if scrub_filter == 'deep':
+        pgs = [item for item in active_pgs if item[1]['scrub_type'] == 'deep']
+    elif scrub_filter == 'shallow':
+        pgs = [item for item in active_pgs if item[1]['scrub_type'] != 'deep']
+    else:
+        pgs = list(active_pgs)
+
+    return sorted(pgs, key=sort_column_key(settings['sort']), reverse=settings['reverse'])
+
+def print_active_pgs(count_shallow, count_deep, all_active_pgs, display_pgs,
+                     tty_height=24, tty_width=80, count_stats=True):
 
     """
     Print the active scrubbing pgs to the terminal.
     Args:
         count_shallow (int): Number of shallow scrubs.
         count_deep (int): Number of deep scrubs.
-        active_pgs (list): List of active scrubbing pgs.
+        all_active_pgs (list): Every active scrubbing pg, unfiltered - used for the
+                               Active/Scrubbing/Obj/s header, exactly as in the
+                               original script, so the type filter and sort order
+                               don't change those figures.
+        display_pgs (list): The (filtered and sorted) pgs to list in the table.
         tty_height (int): Height of the terminal.
         tty_width (int): Width of the terminal.
+        count_stats (bool): Include this display in the average obj/s calculation.
+                            False when redrawing the same data after a settings change.
     """
     # Calculate total number of pgs actively scrubbing and total objects per second.
+    # This always uses the full, unfiltered list of active pgs.
     tot_running = 0
     tot_objs_per_sec = 0.0
-    for pgid,pg in active_pgs:
+    for pgid,pg in all_active_pgs:
         if pg['total_objects']>0 and pg['objects_scrubbed']>0:
             tot_running += 1
             tot_objs_per_sec += pg['objects_per_sec']
-    
+
     # Calculate the average objects per second
     global glob_disp_count, glob_tot_objs_per_sec
-    glob_disp_count += 1
-    glob_tot_objs_per_sec += tot_objs_per_sec
-    avg_per_sec = glob_tot_objs_per_sec / glob_disp_count
+    if count_stats:
+        glob_disp_count += 1
+        glob_tot_objs_per_sec += tot_objs_per_sec
+    avg_per_sec = (glob_tot_objs_per_sec / glob_disp_count) if glob_disp_count else 0.0
 
     # Print the header
-    print(f"Shallow: {count_shallow:<5}  Deep: {count_deep:<5}  Active: {len(active_pgs):<5} ")
+    print(f"Shallow: {count_shallow:<5}  Deep: {count_deep:<5}  Active: {len(all_active_pgs):<5} ")
     print(f"Scrubbing: {tot_running:<5}  Obj/s: {int(tot_objs_per_sec):<5}   Avg Obj/s: {int(avg_per_sec):<5}")
     print(f"\n{'':<7}  {'Scrub':^10}  {'Total':^10}  {'Obj':^10} ")
     print(f"{'PGID':<7}  {'Type':^10}  {'Objects':^10}  {'Scrubbed':^10} {'Obj/s':<6} {'Percent':<8}  ")
     row = 6
 
-            
-    for pgid,pg in active_pgs:
-        if row == tty_height - 4:  
+    # The last screen line available for pg data, leaving room for the footer
+    # and for row 1, which is reserved for the fetch progress message.
+    last_row = tty_height - FOOTER_HEIGHT - 3
+
+    for pgid,pg in display_pgs:
+        if row > last_row:
             # Leave space for the footer
             break
         # Ignore pgs with no objects to scrub or that haven't scrubbed any objects.
@@ -332,11 +468,139 @@ def print_active_pgs(count_shallow, count_deep, active_pgs, tty_height=24, tty_w
             print(f"{pgid:<7}  {pg['scrub_type']:^10}  {pg['total_objects']:<10}  {pg['objects_scrubbed']:<10} {pg['objects_per_sec']:<6.3f}  {percent:<8} {pg['state']}")
             row += 1
 
-    if row < tty_height - 4:
+    if row <= last_row:
         # Fill the remaining lines with empty rows
-        for _ in range(row, tty_height - 3):
+        for _ in range(row, last_row + 1):
             print(" " * tty_width)
             row += 1
+
+def print_footer(settings, tty_width):
+    """
+    Print the settings line and the key help line.
+
+    Args:
+        settings (dict): Current display settings.
+        tty_width (int): Width of the terminal.
+    """
+    order = 'desc' if settings['reverse'] else 'asc'
+    status = (f"Sort: {sort_column_display(settings['sort'])} ({order})   "
+              f"Show: {settings['filter']}   "
+              f"Interval: {settings['interval']:g}s")
+    keys = (f"q=quit  SPACE=refresh  s+({SORT_KEY_HELP})=sort  "
+            f"r=reverse  t=scrub type  +/-=interval")
+
+    print("")
+    print(status[:tty_width].ljust(tty_width))
+    print(keys[:tty_width].ljust(tty_width), end="")
+    sys.stdout.flush()
+
+def change_interval(settings, delta):
+    """
+    Change the refresh interval by delta seconds, clamped to the allowed range.
+    Returns:
+        bool: True if the interval changed.
+    """
+    new_interval = settings['interval'] + delta
+    new_interval = max(MIN_INTERVAL, min(MAX_INTERVAL, new_interval))
+    if new_interval != settings['interval']:
+        settings['interval'] = new_interval
+        return True
+    return False
+
+def handle_key(key, settings):
+    """
+    Act on a key press.
+
+    Args:
+        key (str): The key pressed.
+        settings (dict): Current display settings, updated in place.
+    Returns:
+        str: 'quit', 'refresh' (re-read from ceph), 'redraw' (re-display the
+             data we already have) or '' (nothing to do).
+    """
+    if settings.get('awaiting_sort'):
+        # 's' was pressed on the previous key press; this key picks the column.
+        settings['awaiting_sort'] = False
+        column = SORT_KEY_MAP.get(key)
+        if column:
+            settings['sort'] = column
+            return 'redraw'
+        # Not a recognised column key - ignore and go back to normal keys.
+        return ''
+
+    if key == 'q':
+        return 'quit'
+    if key == ' ':
+        return 'refresh'
+
+    if key == 's':
+        # Wait for the next key press to say which column to sort by.
+        settings['awaiting_sort'] = True
+        return ''
+    if key == 'r':
+        settings['reverse'] = not settings['reverse']
+        return 'redraw'
+    if key == 't':
+        idx = SCRUB_FILTERS.index(settings['filter'])
+        settings['filter'] = SCRUB_FILTERS[(idx + 1) % len(SCRUB_FILTERS)]
+        return 'redraw'
+    if key in ('+', '='):
+        return 'redraw' if change_interval(settings, INTERVAL_STEP) else ''
+    if key in ('-', '_'):
+        return 'redraw' if change_interval(settings, -INTERVAL_STEP) else ''
+
+    return ''
+
+def wait_for_interval(nbc, settings):
+    """
+    Wait for the refresh interval, watching for key presses.
+
+    Args:
+        nbc (NonBlockingConsole): Console used to read key presses.
+        settings (dict): Current display settings, updated in place.
+    Returns:
+        str: 'refresh' or 'redraw'.
+    Raises:
+        KeyboardInterrupt: If 'q' is pressed.
+    """
+    timer = 0.0
+    while timer < settings['interval']:
+        key = nbc.get_data()
+        if key:
+            action = handle_key(key, settings)
+            if action == 'quit':
+                raise KeyboardInterrupt
+            if action in ('refresh', 'redraw'):
+                return action
+        time.sleep(POLL_STEP)
+        timer += POLL_STEP
+    return 'refresh'
+
+def parse_args():
+    """
+    Parse the command line options.
+    Returns:
+        argparse.Namespace: The parsed options.
+    """
+    parser = argparse.ArgumentParser(
+        description="Show the pgs that are actively scrubbing, with periodic updates.")
+    parser.add_argument('-s', '--sort', choices=SORT_NAMES, default='pgid',
+                        help="Column to sort the display by (default: pgid).")
+    parser.add_argument('-r', '--reverse', action='store_true',
+                        help="Sort in descending order.")
+    parser.add_argument('-t', '--type', choices=SCRUB_FILTERS, default='both',
+                        help="Scrub types to show (default: both).")
+    parser.add_argument('-i', '--interval', type=float, default=DEFAULT_INTERVAL,
+                        metavar='SECONDS',
+                        help="Seconds between refreshes, {:g}-{:g} (default: {:g}).".format(
+                            MIN_INTERVAL, MAX_INTERVAL, DEFAULT_INTERVAL))
+    args = parser.parse_args()
+
+    if not MIN_INTERVAL <= args.interval <= MAX_INTERVAL:
+        parser.error("interval must be between {:g} and {:g} seconds.".format(
+            MIN_INTERVAL, MAX_INTERVAL))
+
+    return args
 
 def trim_idle_pgs(scrubbing_pgs, idle_pgs):
     """
@@ -347,11 +611,27 @@ def trim_idle_pgs(scrubbing_pgs, idle_pgs):
             del idle_pgs[pgid]
 
 def main():
+    args = parse_args()
+
+    # Display settings, changed by the interactive keys.
+    settings = {'sort': args.sort,
+                'reverse': args.reverse,
+                'filter': args.type,
+                'interval': args.interval,
+                'awaiting_sort': False}
+
     # Get the terminal size to adjust output accordingly.
     tty_size = shutil.get_terminal_size()
 
     last_pg_run = {} # Preserved list of pgs that were scrubbing the last time we checked.
     idle_pgs = {}  # Dictionary to track idle pgs
+
+    # Data from the last fetch, kept so a settings change can redraw without
+    # going back to ceph.
+    active_pgs = []
+    count_shallow = 0
+    count_deep = 0
+    need_fetch = True
 
     try:
         # Blank the screen and hide the cursor.
@@ -363,42 +643,42 @@ def main():
 
             # Loop fetching and displaying pg data.
             while True:
-                # Reset the cursor to the top left of the screen.
-                reset_cursor()
-
                 # Check if the terminal size has changed.  If it has, clear the screen.
                 cur_tty_size = shutil.get_terminal_size()
                 if cur_tty_size != tty_size:
                     tty_size = cur_tty_size
                     clear_screen()
 
-                # Get the pg info from ceph and find the pgs that are currently scrubbing.
-                scrubbing_pgs, count_shallow, count_deep = fetch_pg_data()
-                # Trim the idle_pgs dictionary to remove pgs that are no longer scrubbing.
-                trim_idle_pgs(scrubbing_pgs, idle_pgs)
-                # Get the active pgs that are currently scrubbing.
-                active_pgs = get_active_pgs(scrubbing_pgs, last_pg_run, idle_pgs)
+                if need_fetch:
+                    # Get the pg info from ceph and find the pgs that are currently scrubbing.
+                    # This shows/clears its progress message on row 1.
+                    scrubbing_pgs, count_shallow, count_deep = fetch_pg_data()
+                    # Trim the idle_pgs dictionary to remove pgs that are no longer scrubbing.
+                    trim_idle_pgs(scrubbing_pgs, idle_pgs)
+                    # Get the active pgs that are currently scrubbing.
+                    active_pgs = get_active_pgs(scrubbing_pgs, last_pg_run, idle_pgs)
+                    # Save the list just fetched.
+                    last_pg_run = scrubbing_pgs
 
-                # Display the currently scrubbing pgs.
-                print_active_pgs(count_shallow, count_deep, active_pgs, tty_size.lines, tty_size.columns)
+                # Move to the start of the content area (row 2), leaving row 1
+                # as fetch_pg_data left it - either blank, or unused if this
+                # was a settings-only redraw.
+                goto_content_start()
 
-                # Save the list just displayed.
-                last_pg_run = scrubbing_pgs
+                # Apply the scrub type filter and the sort order.
+                display_pgs = filter_and_sort_pgs(active_pgs, settings)
 
-                padding = ' ' * (tty_size.columns - 34)
-                print(f"\nPress 'q' to exit or ' ' to refresh. {padding}",end="")
+                # Display the currently scrubbing pgs.  all_active_pgs keeps the
+                # header stats unaffected by the filter/sort, per the original script.
+                print_active_pgs(count_shallow, count_deep, active_pgs, display_pgs,
+                                 tty_size.lines, tty_size.columns,
+                                 count_stats=need_fetch)
 
-                # Wait for refresh interval
-                timer= 0
-                incr = 0.2
-                while timer<4:
-                    key = nbc.get_data()
-                    if key == 'q':  # x1b is ESC
-                        raise KeyboardInterrupt
-                    elif key == ' ':
-                        break
-                    time.sleep(incr)
-                    timer += incr
+                print_footer(settings, tty_size.columns)
+
+                # Wait for refresh interval.  A settings change redraws the data
+                # we already have rather than re-reading it from ceph.
+                need_fetch = wait_for_interval(nbc, settings) == 'refresh'
 
     except KeyboardInterrupt:
 #        clear_screen()  # TODO: Uncomment
