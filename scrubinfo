@@ -25,14 +25,14 @@
 #---------------------------------------------------------------------------------
 #
 # usage: scrubinfo [-h]
-#                  [--sort {pg_id,acting,scrub_stamp,deep_scrub_stamp,last_scrub_duration,scrub_scheduling,objects,objects_scrubbed}]
+#                  [--sort {pg_id,scrub_stamp,deep_scrub_stamp,last_scrub_duration,scrub_scheduling,objects,objects_scrubbed}]
 #                  [--pool POOL] [--list-pools] [--reverse] [--version]
 #
 # Extract and display specific columns from ceph pg dump pgs
 #
 # optional arguments:
 #   -h, --help            show this help message and exit
-#   --sort {pg_id,acting,scrub_stamp,deep_scrub_stamp,last_scrub_duration,scrub_scheduling,objects,objects_scrubbed}, -s {pg_id,acting,scrub_stamp,deep_scrub_stamp,last_scrub_duration,scrub_scheduling,objects,objects_scrubbed}
+#   --sort {pg_id, scrub_stamp,deep_scrub_stamp,last_scrub_duration,scrub_scheduling,objects,objects_scrubbed}, -s {pg_id,scrub_stamp,deep_scrub_stamp,last_scrub_duration,scrub_scheduling,objects,objects_scrubbed}
 #                         Column to sort by (default: pg_id)
 #   --pool POOL, -p POOL  Pool ID to filter PGs (e.g., "1" for pool 1)
 #   --list-pools, -l      List available pools and exit
@@ -51,7 +51,7 @@ import json
 import argparse
 import sys
 
-__version__ = '1.0.0'
+__version__ = '1.1'
 
 def run_ceph_pg_dump():
     """Get PG information from Ceph."""
@@ -87,7 +87,6 @@ def extract_pg_data(pg_stats, pool_filter=None):
         # Extract required columns
         row = {
             'pg_id': pg.get('pgid', ''),
-            'acting': '[' + ','.join(map(str, pg.get('acting', []))) + ']',
             'scrub_stamp': pg.get('last_scrub_stamp', ''),
             'deep_scrub_stamp': pg.get('last_deep_scrub_stamp', ''),
             'last_scrub_duration': pg.get('last_scrub_duration', 0),
@@ -131,7 +130,6 @@ def format_output(data):
     # Define column headers and their display widths
     headers = {
         'pg_id': 'PG_ID',
-        'acting': 'ACTING',
         'scrub_stamp': 'SCRUB_STAMP',
         'deep_scrub_stamp': 'DEEP_SCRUB_STAMP',
         'last_scrub_duration': 'DURATION',
@@ -194,7 +192,7 @@ Examples:
     
     parser.add_argument(
         '--sort', '-s',
-        choices=['pg_id', 'acting', 'scrub_stamp', 'deep_scrub_stamp', 
+        choices=['pg_id', 'scrub_stamp', 'deep_scrub_stamp',
                 'last_scrub_duration', 'scrub_scheduling', 'objects', 'objects_scrubbed'],
         default='pg_id',
         help='Column to sort by (default: pg_id)'
