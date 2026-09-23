@@ -2,7 +2,7 @@
 
 Assorted BASH and Python command line scripts for administering a [Ceph](https://ceph.io/) storage cluster — built to cut down on repetitive typing and to pull information from multiple sources with a single command.
 
-Maintained by [lancs-gridpp](https://github.com/lancs-gridpp).
+Maintained by [Gerard Hand](https://github.com/lancs-gridpp).
 
 ## Contents
 
@@ -37,12 +37,12 @@ Maintained by [lancs-gridpp](https://github.com/lancs-gridpp).
 
 ### Scrubbing
 
-| Script | Description |
-|---|---|
-| `activescrubs` | Show PGs currently scrubbing, with periodic updates. |
-| `scrubinfo` | Show PG scrubbing information. |
-| `scrubintervals` | Show the current scrubbing configuration settings. |
-| `scrubsched` | Show details of scrubbing intervals. |
+| Script | Description                                                                                               |
+|---|-----------------------------------------------------------------------------------------------------------|
+| `activescrubs` | Show PGs currently scrubbing, with periodic updates.                                                      |
+| `ceph_scrub_sheculer` | Disable ceph PG scrub scheduling and manually scrub PGs starting with PGs with the oldest scrubbing dates | 
+| `scrubinfo` | Show PG scrubbing information.                                                                            |
+| `scrubintervals` | Show the current scrubbing configuration settings.                                                        |
 
 ### CephFS
 
@@ -67,21 +67,7 @@ Maintained by [lancs-gridpp](https://github.com/lancs-gridpp).
 
 ## Installation
 
-Clone the repository onto a machine with access to your Ceph cluster (e.g. a MON or admin node):
-
-```bash
-git clone https://github.com/lancs-gridpp/ceph-utils.git
-cd ceph-utils
-```
-
-Make the scripts executable and put them on your `PATH`:
-
-```bash
-chmod +x *
-export PATH="$PWD:$PATH"
-```
-
-An `update-ceph-utils` script is included for pulling in the latest changes.
+Download _update-ceph-utils_ and make the file executable.  When this script is run it will extract the files from github into _/usr/local/share/ceph-utils_.  It will then create symbolic links to the files in _/usr/local/bin_.  If you want to use different locations for the files change `CEPH_UTILS_DIR` and `BIN_DIR` in the script. 
 
 > Most scripts assume a working `ceph` CLI and appropriate cluster admin credentials are already configured on the host they're run from.
 

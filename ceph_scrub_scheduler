@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ceph_scrub_scheduler.py
+ceph_scrub_scheduler
 
 Scrubs all Ceph PGs from the oldest scrub date to the newest.  Shallow and
 deep scrub can be specified.
