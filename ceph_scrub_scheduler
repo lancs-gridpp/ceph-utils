@@ -1,18 +1,68 @@
 #!/usr/bin/env python3
-"""
-ceph_scrub_scheduler
 
-Scrubs all Ceph PGs from the oldest scrub date to the newest.  Shallow and
-deep scrub can be specified.
-
-The OSD flags noscrub and nodeep-scrub are set while the program is running
-to prevent ceph scrubbing PGs that have been scrubbed more recently.  The
-flags are always restored to their initial state at the program end.
-
-Run on machines that have a working ceph command.
-
-Compatible with python 3.6.8 (Rocky 8)
-"""
+# ---------------------------------------------------------------------------------
+# Copyright (c) 2026 Lancaster University
+# Written by: Gerard Hand
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# ---------------------------------------------------------------------------------
+#
+# ceph_scrub_scheduler
+#
+# Scrubs all Ceph PGs from the oldest scrub date to the newest.  Shallow and
+# deep scrub can be specified.
+#
+# The OSD flags noscrub and nodeep-scrub are set while the program is running
+# to prevent ceph scrubbing PGs that have been scrubbed more recently.  The
+# flags are always restored to their initial state at the program end.
+#
+# Run on machines that have a working ceph command.
+#
+# Compatible with python 3.6.8 (Rocky 8)
+# 
+# ---------------------------------------------------------------------------------
+#
+# usage:
+#       ceph_scrub_scheduler [-h] [-m MAX_CONCURRENT_DEEP]
+#                            [-n MAX_CONCURRENT_SHALLOW] [-p POLL_INTERVAL]
+#                            [-c] [-v] [-d] [-s] [-V]
+#
+# optional arguments:
+#   -h, --help            show this help message and exit
+#   -m MAX_CONCURRENT_DEEP, --max-concurrent-deep MAX_CONCURRENT_DEEP
+#                         Max simultaneous deep-scrubs to have in flight
+#                         (default: 50)
+#   -n MAX_CONCURRENT_SHALLOW, --max-concurrent-shallow MAX_CONCURRENT_SHALLOW
+#                         Max simultaneous shallow-scrubs to have in flight
+#                         (default: 50)
+#   -p POLL_INTERVAL, --poll-interval POLL_INTERVAL
+#                         Seconds between status polls (default: 300 = 5
+#                         minutes)
+#   -c, --continuous      Run forever, restarting deep/shallow cycles
+#                         independently at ceph's configured
+#                         osd_deep_scrub_interval / osd_scrub_min_interval
+#   -v, --verbose         Enable debug logging
+#   -d, --deep            Perform deep scrubbing
+#   -s, --shallow         Perform shallow scrubbing
+#   -V, --version         show program's version number and exit
+#
 
 import argparse
 import json
