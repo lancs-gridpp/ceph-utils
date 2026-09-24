@@ -36,7 +36,7 @@
 # Run on machines that have a working ceph command.
 #
 # Compatible with python 3.6.8 (Rocky 8)
-# 
+#
 # ---------------------------------------------------------------------------------
 #
 # usage:

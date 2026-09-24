@@ -48,12 +48,6 @@
 #   d / u    Scroll the pg list down / up by one page.
 #   g / G    Jump to the top / bottom of the pg list.
 #
-# Things to do:
-# * If an active scrub doesn't update the number of objects scrubbed on a refresh
-#   it continues to be shown as active for an 'idle' period.  This is currently
-#   based on the number of refreshes done since it stopped updating the number of
-#   objects scrubbed.  This might be better being a timebased idle period.
-
 
 import argparse
 from datetime import datetime, timedelta
