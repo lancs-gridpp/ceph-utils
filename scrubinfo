@@ -46,12 +46,13 @@
 #   scrubinfo --pool 2 --sort last_scrub_duration  # Pool 2 PGs sorted by scrub duration
 #
 
-import subprocess
-import json
 import argparse
+import json
+import os
+import subprocess
 import sys
 
-__version__ = '1.2'
+__version__ = '1.2.1'
 
 
 def run_ceph_pg_dump():
@@ -252,7 +253,7 @@ def main():
 
     # Sort data
     sorted_data = sort_data(extracted_data, args.sort, args.reverse)
-
+    
     # Display results
     if args.pool:
         print("PGs from pool {} (sorted by {}):".format(args.pool, args.sort))
@@ -266,4 +267,15 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Trap exception caused by output being piped to less and less being quit before all
+        # the output has been viewed.
+        #
+        # Python flushes standard streams on exit; redirect remaining output
+        # to devnull to avoid another BrokenPipeError at shutdown
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(1)
