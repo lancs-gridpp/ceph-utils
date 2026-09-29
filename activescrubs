@@ -472,7 +472,7 @@ def print_active_pgs(count_shallow, count_deep, all_active_pgs, window,
     print(f"Shallow: {count_shallow:<5}  Deep: {count_deep:<5}  Active: {len(all_active_pgs):<5} ")
     print(f"Scrubbing: {tot_running:<5}  Obj/s: {int(tot_objs_per_sec):<5}   Avg Obj/s: {int(avg_per_sec):<5}")
     print(f"\n{'':<7}  {'Scrub':^10}  {'Total':^10}  {'Obj':^10} ")
-    print(f"{'PGID':<7}  {'Type':^10}  {'Objects':^10}  {'Scrubbed':^10} {'Obj/s':<6} {'Percent':<8}  ")
+    print(f"{'PGID':<7}  {'Type':^10}  {'Objects':^10}  {'Scrubbed':^10} {'Obj/s':<8} {'Percent':<9}  ")
     row = 6
 
     last_row = compute_last_row(tty_height)
@@ -482,7 +482,7 @@ def print_active_pgs(count_shallow, count_deep, all_active_pgs, window,
             # The window should already fit, but don't overrun the footer if not.
             break
         percent = f"{(pg['objects_scrubbed'] / pg['total_objects'] * 100):.2f}%"
-        print(f"{pgid:<7}  {pg['scrub_type']:^10}  {pg['total_objects']:<10}  {pg['objects_scrubbed']:<10} {pg['objects_per_sec']:<6.3f}  {percent:<8} {pg['state']}")
+        print(f"{pgid:<7}  {pg['scrub_type']:^10}  {pg['total_objects']:<10}  {pg['objects_scrubbed']:<10} {pg['objects_per_sec']:<8.3f}  {percent:<9} {pg['state']}   ")
         row += 1
 
     if row <= last_row:
