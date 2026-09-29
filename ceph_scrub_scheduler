@@ -83,7 +83,7 @@ BAD_STATE_MARKERS = ("down", "incomplete", "peering", "stale", "inactive")
 # Used to parse ceph json looking for "inf" where a numeric value should be.
 _BARE_INF_RE = re.compile(r'(?<=[:,\[\s])(-?inf)(?=[,\]\}\s])')
 
-SOFTWARE_VERSION = "1.0"
+SOFTWARE_VERSION = "1.0.1"
 
 class CephError(RuntimeError):
     pass
@@ -198,7 +198,7 @@ def set_flags(flags) -> None:
 class ScrubState:
     """Tracks queue/in-flight/completion state for one scrub type (deep or shallow)."""
 
-    def __init__(self, name, command, stamp_field, max_concurrent, interval=None):
+    def __init__(self, name, command, stamp_field, max_concurrent, interval, is_deep):
         self.name = name                        # "deep" or "shallow" -- used in logging.
         self.command = command                  # ceph pg subcommand: "deep-scrub" or "scrub".
         self.stamp_field = stamp_field          # pg_stats field that changes on completion.
@@ -216,6 +216,8 @@ class ScrubState:
         self.start_time = 0.0                   # The time the current scrub cyle started.
         self.next_run = 0.0                     # Time the next scrub run should start.  Only if continuous scrubbing.
         self.finished_for_good = False          # True once a non-continuous run has drained
+        self.is_deep = is_deep                  # True iff this is for deep scrubs
+
 
 
 def get_scrub_intervals():
@@ -251,7 +253,8 @@ def issue_scrub_commands(state):
             state.completed += 1
             continue
 
-        if "scrubbing" not in pg_state:
+        # if "scrubbing" not in pg_state:
+        if not scrubbing(state,pg_state):
             log.info(f"{state.name.capitalize()}: issuing {state.command} for {pgid} "
                      f"({state.completed + len(state.in_flight) + 1}/{state.total} queued so far)")
             run_ceph(["pg", state.command, pgid])
@@ -260,6 +263,8 @@ def issue_scrub_commands(state):
 
         state.in_flight[pgid] = info.get(state.stamp_field)
 
+def scrubbing(state,pg_state)->bool:
+    return "scrubbing" in pg_state and (state.is_deep and "deep" in pg_state or not state.is_deep and not "deep" in pg_state)
 
 def check_progress(state, fresh_stats):
     """Update in-flight PGs for one scrub type against a fresh pg_stats snapshot."""
@@ -423,10 +428,10 @@ def main():
     states = []
     if args.deep:
         states.append(
-            ScrubState("deep", "deep-scrub", "last_deep_scrub_stamp", args.max_concurrent_deep, deep_interval))
+            ScrubState("deep", "deep-scrub", "last_deep_scrub_stamp", args.max_concurrent_deep, deep_interval,True))
     if args.shallow:
         states.append(
-            ScrubState("shallow", "scrub", "last_shallow_scrub_stamp", args.max_concurrent_shallow, shallow_interval))
+            ScrubState("shallow", "scrub", "last_shallow_scrub_stamp", args.max_concurrent_shallow, shallow_interval, False))
 
     try:
         log.debug("Checking current noscrub/nodeep-scrub flag state")
