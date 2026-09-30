@@ -144,7 +144,7 @@ def get_pg_stats() -> dict:
     for pg in pg_stats:
         # print(f"PG: {pg}") # DEBUG
         stats[pg["pgid"]] = {"state": pg.get("state", ""), "last_deep_scrub_stamp": pg.get("last_deep_scrub_stamp"),
-            "last_shallow_scrub_stamp": pg.get("last_scrub_stamp"), }  # print(f"stat: {stats[pg['pgid']]}") # DEBUG
+            "last_shallow_scrub_stamp": pg.get("last_scrub_stamp"), "scheduling": pg.get("scrub_schedule","") }
     return stats
 
 
@@ -155,7 +155,6 @@ def is_eligible(state) -> bool:
 def build_queue(pg_stats) -> Tuple[list, list]:
     """Return deep and shallow scrub queues, oldest scrubbed first."""
     eligible = [(pgid, info) for pgid, info in pg_stats.items() if is_eligible(info["state"])]
-
     skipped = len(pg_stats) - len(eligible)
     if skipped:
         log.warning("%d PG(s) skipped (not active/clean at start): they will be "
@@ -168,7 +167,6 @@ def build_queue(pg_stats) -> Tuple[list, list]:
         return parse_stamp(stamp)
 
     deep = sorted(eligible, key=lambda item: sort_key(item, "last_deep_scrub_stamp"))
-
     shallow = sorted(eligible, key=lambda item: sort_key(item, "last_shallow_scrub_stamp"))
 
     return ([pgid for pgid, _ in deep], [pgid for pgid, _ in shallow],)
@@ -253,25 +251,28 @@ def issue_scrub_commands(state):
             state.completed += 1
             continue
 
-        # if "scrubbing" not in pg_state:
-        if not scrubbing(state,pg_state):
-            log.info(f"{state.name.capitalize()}: issuing {state.command} for {pgid} "
-                     f"({state.completed + len(state.in_flight) + 1}/{state.total} queued so far)")
-            run_ceph(["pg", state.command, pgid])
-        else:
-            log.info(f"{state.name.capitalize()}: PG {pgid} is already scrubbing")
+        # Check that the pg isn't scrubbing for the state and isn't scrubbing for the other state.
+        # Issuing a scrub to a pg that is deep scrubbing does nothing.
+        state_scrubbing = scrubbing(state,pg_state)
+        other_state_scrubbing = not state_scrubbing and "scrubbing" in pg_state
+        if not other_state_scrubbing:
+            if state_scrubbing:
+                log.info(f"{state.name.capitalize()}: PG {pgid} is already scrubbing")
+            else:
+                log.info(f"{state.name.capitalize()}: issuing {state.command} for {pgid} "
+                         f"({state.completed + len(state.in_flight) + 1}/{state.total} queued so far)")
+                run_ceph(["pg", state.command, pgid])
 
-        state.in_flight[pgid] = info.get(state.stamp_field)
+            state.in_flight[pgid] = info.get(state.stamp_field)
 
 def scrubbing(state,pg_state)->bool:
+    """Determine if the pg in 'pg_state' is scrubbing."""
     return "scrubbing" in pg_state and (state.is_deep and "deep" in pg_state or not state.is_deep and not "deep" in pg_state)
 
 def check_progress(state, fresh_stats):
     """Update in-flight PGs for one scrub type against a fresh pg_stats snapshot."""
     for pgid in list(state.in_flight):
-        # print(f"Checking {pgid}") # DEBUG
         info = fresh_stats.get(pgid)
-        # print(f"Info: {info}") # DEBUG
         if info is None:
             log.warning(f"{state.name}: PG {pgid} no longer reported by ceph pg dump; treating as done")
             del state.in_flight[pgid]
@@ -280,7 +281,6 @@ def check_progress(state, fresh_stats):
 
         old_stamp = state.in_flight[pgid]
         new_stamp = info.get(state.stamp_field)
-        # print(f"new_stamp: {new_stamp}, old_stamp: {old_stamp}") # DEBUG
         finished = new_stamp and (old_stamp is None or parse_stamp(new_stamp) > parse_stamp(old_stamp))
 
         if finished:
@@ -290,6 +290,17 @@ def check_progress(state, fresh_stats):
         elif not is_eligible(info.get("state", "")):
             log.warning(
                 f"{state.name}: PG {pgid} left eligible state mid-scrub (state={info.get('state')})")  # else: still scrubbing, leave it in flight
+        elif "queued" in info.get("scheduling", ""):
+                # The PG scheduling is showing as queued.  Remove the PG from the in_flight list.
+                log.info(f"{state.name}: PG {pgid} was queued. Removing from in_flight")
+                del state.in_flight[pgid]
+
+    # If a queued scrub starts in the background, it won't be in the "in_flight" list.
+    for pgid, info in fresh_stats.items():
+        if scrubbing(state,info) and pgid not in state.in_flight:
+            # log.info(f"info: {info}")  # DEBUG
+            log.info(f"{state.name}: PG {pgid} is now scrubbing.  Adding to in_flight")
+            state.in_flight[pgid] = info.get(state.stamp_field,{})
 
 
 def args_are_valid(args):
@@ -436,7 +447,6 @@ def main():
     try:
         log.debug("Checking current noscrub/nodeep-scrub flag state")
         initial_flags = get_osd_flags()
-
         log.info(f"Initial state: noscrub={initial_flags['noscrub']} nodeep-scrub={initial_flags['nodeep-scrub']}")
 
         log.info("Fetching current PG stats")
